@@ -23,7 +23,18 @@ func RepoRoot() (string, error) {
 // StagedDiff returns the diff of the index against HEAD for the current
 // repository. It errors when nothing is staged.
 func StagedDiff() ([]byte, error) {
-	out, err := exec.Command("git", "diff", "--cached", "--no-ext-diff", "--no-color").Output()
+	return StagedDiffDir("")
+}
+
+// StagedDiffDir is StagedDiff for the repository at dir ("" = the current
+// directory). SourceTree custom actions pass the repo path as $REPO, so gen
+// may run from anywhere.
+func StagedDiffDir(dir string) ([]byte, error) {
+	args := []string{"diff", "--cached", "--no-ext-diff", "--no-color"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := exec.Command("git", args...).Output()
 	if err != nil {
 		var ee *exec.ExitError
 		if errors.As(err, &ee) && len(ee.Stderr) > 0 {

@@ -37,17 +37,53 @@ SourceTree 升级几乎不会影响我们；换用其他 Git GUI（Tower、Fork�
 | review 阻断策略 | 先建议后阻断：默认不拦截，严格模式（pre-commit 返回非零）用配置开关，默认关 |
 | 配置作用域 | 双层：全局 `~/.config/stai/config.toml` + 仓库级 `.stai.toml`（可提交，团队共享约定） |
 
-## 接入方式（M1 目标形态）
+## 使用方式
+
+### 安装与注册
+
+在仓库根目录执行（全局安装后任意仓库都可运行）：
 
 ```bash
-# 安装后注册：写 git 钩子 + 注册 SourceTree 自定义操作
-stai install
-
-# SourceTree 菜单里会出现：
-#   动作 → AI 生成提交信息   # 生成并复制到剪贴板
-#   动作 → AI 审查暂存区     # M2
-# 每次提交时空信息由 prepare-commit-msg 钩子兜底生成
+stai install                  # 写 prepare-commit-msg 钩子 + 注册 SourceTree 自定义操作
+stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 ```
+
+`install` 做了两件事：
+
+1. 向当前仓库写入 `prepare-commit-msg` 钩子（内容只有一行调用，指向 stai 二进制）；
+2. 向 SourceTree 的自定义操作存储写入条目：
+   `~/Library/Application Support/SourceTree/actions.plist`（NSKeyedArchiver
+   格式，schema 取自 4.2.19 实机生成的条目），菜单项 **AI 生成提交信息**，
+   参数 `gen --edit $REPO`（SourceTree 会把 `$REPO` 展开为仓库路径传入）。
+
+该操作是幂等的：重复执行会替换指向本二进制或同名的旧条目，其他工具
+创建的条目原样保留。
+注意：**重装前先退出 SourceTree**——它在运行时会用内存中的动作列表
+覆盖 `actions.plist`，导致写入丢失。注册后需重启 SourceTree 菜单才会出现。
+
+### 日常流程（M1：commit 信息生成）
+
+两条通道互补，互不干扰：
+
+1. **自定义操作（人确认，推荐）**
+   SourceTree 里暂存改动 → 菜单栏「动作 → 自定义操作 → AI 生成提交信息」→
+   弹出可编辑对话框，可手动调整 → 点「确定」后自动复制到剪贴板 →
+   粘贴进提交框提交。
+   等价命令行：`stai gen --edit`；`stai gen` 则跳过弹窗直接生成并复制。
+
+2. **钩子兜底（零操作）**
+   直接提交且提交框留空时，`prepare-commit-msg` 钩子会自动生成信息填进
+   提交框。merge / squash / commit（--amend）类提交和已有信息的提交一律
+   不碰；生成失败只打印警告，绝不阻断提交（内部 120 秒超时保护）。
+
+临时禁用钩子（不卸载）：`STAI_DISABLE=1 git commit ...`
+
+### 环境变量覆盖
+
+| 变量 | 作用 |
+| --- | --- |
+| `STAI_BASE_URL` / `STAI_API_KEY` / `STAI_MODEL` | 覆盖 provider 配置 |
+| `STAI_DISABLE` | 非空时钩子直接放行 |
 
 ## 配置
 

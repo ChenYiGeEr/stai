@@ -76,7 +76,8 @@ Disable hooks without uninstalling: STAI_DISABLE=1
 // cmdGen implements "stai gen": generate a commit message for the staged
 // diff and copy it to the clipboard so it can be pasted into SourceTree.
 // With -edit, the message first shows in an editable macOS dialog; the
-// edited text is what gets copied.
+// edited text is what gets copied. An optional positional argument is the
+// repository path (SourceTree passes $REPO).
 func cmdGen(args []string) {
 	fs := flag.NewFlagSet("gen", flag.ExitOnError)
 	copyFlag := fs.Bool("copy", true, "copy the generated message to the clipboard")
@@ -86,7 +87,13 @@ func cmdGen(args []string) {
 	cfg, err := config.Load()
 	fatal(err)
 
-	diff, err := git.StagedDiff()
+	// SourceTree custom actions append $REPO (the repository path) to the
+	// parameters; the plain CLI passes nothing and uses the current dir.
+	repoDir := ""
+	if fs.NArg() > 0 {
+		repoDir = fs.Arg(0)
+	}
+	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model)
@@ -220,7 +227,7 @@ func cmdInstall(args []string) {
 Add it manually: SourceTree → Settings → Custom Actions → Add:
   Menu caption:  AI 生成提交信息
   Script to run: %s
-  Parameters:    gen --edit
+  Parameters:    gen --edit $REPO
 Then run "stai gen" in the repo (it copies the message for the commit box).
 `, err, exe)
 		return
@@ -228,56 +235,72 @@ Then run "stai gen" in the repo (it copies the message for the commit box).
 	fmt.Println("SourceTree custom action registered: AI 生成提交信息 (restart SourceTree)")
 }
 
-const sourceTreeDomain = "com.torusknot.SourceTreeNotMAS"
+// actionCaption is the menu caption of the SourceTree custom action.
+const actionCaption = "AI 生成提交信息"
 
-// installSourceTreeAction registers the custom action in SourceTree's
-// preferences. The entry schema (name/command/parameters + has*Param flags)
-// was recovered from the Sourcetree 4.2.19 binary. Re-running replaces the
-// previous stai entry (older binary path or outdated parameters), but never
-// touches custom actions created outside stai.
+// installSourceTreeAction registers the custom action in SourceTree's real
+// action storage: ~/Library/Application Support/SourceTree/actions.plist,
+// an NSKeyedArchiver plist of mutable dictionaries. The schema below was
+// captured from a Sourcetree 4.2.19-generated entry (verified at runtime:
+// adding an action in the UI rewrites exactly this file). The defaults
+// "customActions" key is a legacy migration path and no longer feeds the
+// UI, which is why the original defaults-based install never showed up.
+// Read-modify-write runs in one JXA script so a crash midway cannot corrupt
+// the file; entries owned by other tools are preserved.
 func installSourceTreeAction(exe string) error {
-	dict := fmt.Sprintf(`{
-		name = "AI 生成提交信息";
-		command = "%s";
-		parameters = "gen --edit";
-		hasFileParam = 0;
-		hasRepoParam = 1;
-		hasSHAParam = 0;
-	}`, exe)
-
-	if out, err := exec.Command("defaults", "read", sourceTreeDomain, "customActions").Output(); err == nil {
-		// Drop every entry that already points at this stai binary (a stale
-		// duplicate can survive when SourceTree rewrites its cached prefs
-		// while running). Refuse to touch entries owned by other tools.
-		ours, foreign := 0, 0
-		for _, line := range strings.Split(string(out), "\n") {
-			line = strings.TrimSpace(line)
-			if !strings.HasPrefix(line, "command =") {
-				continue
-			}
-			if strings.Contains(line, exe) {
-				ours++
-			} else {
-				foreign++
-			}
-		}
-		if foreign > 0 {
-			return fmt.Errorf("customActions has entries from other tools; update the stai one manually")
-		}
-		if ours > 0 {
-			if err := exec.Command("defaults", "delete", sourceTreeDomain, "customActions").Run(); err != nil {
-				return fmt.Errorf("defaults delete: %w", err)
-			}
-		}
-	}
-
-	cmd := exec.Command("defaults", "write", sourceTreeDomain, "customActions", "-array-add", dict)
+	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", actionPlistJXA,
+		"--", exe, actionCaption, "gen --edit $REPO")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return fmt.Errorf("defaults write: %v: %s", err, strings.TrimSpace(string(out)))
+		return fmt.Errorf("updating actions.plist: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
 }
+
+// actionPlistJXA deduplicates and appends the stai entry in actions.plist.
+// argv: exe path, menu caption, parameters ($REPO is expanded by SourceTree
+// to the repository path at run time).
+const actionPlistJXA = `function run(argv) {
+	ObjC.import('Foundation');
+	var exe = argv[0], caption = argv[1], params = argv[2];
+	var path = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Application Support/SourceTree/actions.plist');
+	var list = $.NSMutableArray.alloc.init;
+	var fm = $.NSFileManager.defaultManager;
+	if (fm.fileExistsAtPath(path)) {
+		var data = $.NSData.dataWithContentsOfFile(path);
+		if (data && data.length > 0) {
+			var obj = $.NSKeyedUnarchiver.unarchiveObjectWithData(data);
+			if (obj && obj.isKindOfClass($.NSArray.class)) {
+				list = $.NSMutableArray.arrayWithArray(obj);
+			}
+		}
+	}
+	var kept = $.NSMutableArray.alloc.init;
+	for (var i = 0; i < list.count; i++) {
+		var d = list.objectAtIndex(i);
+		var t = d.objectForKey('target');
+		var n = d.objectForKey('name');
+		if (t && t.isEqualToString(exe)) continue;
+		if (n && n.isEqualToString(caption)) continue;
+		kept.addObject(d);
+	}
+	var e = $.NSMutableDictionary.alloc.init;
+	e.setObjectForKey(caption, 'name');
+	e.setObjectForKey(exe, 'target');
+	e.setObjectForKey(params, 'params');
+	e.setObjectForKey($.NSNumber.numberWithBool(false), 'fileAction');
+	e.setObjectForKey($.NSNumber.numberWithBool(false), 'logAction');
+	e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
+	e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
+	e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
+	e.setObjectForKey($.NSNumber.numberWithInt(-1), 'shortcutKeyCode');
+	e.setObjectForKey($.NSNumber.numberWithInt(0), 'shortcutKeyModifiers');
+	e.setObjectForKey('', 'shortcutKeyDisplay');
+	kept.addObject(e);
+	var out = $.NSKeyedArchiver.archivedDataWithRootObject(kept);
+	if (!out.writeToFileAtomically(path, true)) throw Error('write failed: ' + path);
+	return 'actions.plist now has ' + kept.count + ' entries';
+}`
 
 func copyToClipboard(s string) error {
 	cmd := exec.Command("pbcopy")
