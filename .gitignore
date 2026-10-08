@@ -1,0 +1,34 @@
+# Built binaries
+/stai
+/bin/
+/dist/
+*.exe
+*.dll
+*.so
+*.dylib
+
+# Test & coverage artifacts
+*.test
+*.out
+coverage.*
+
+# Go workspace files
+go.work
+go.work.sum
+
+# Dependency vendoring (uncomment if vendoring deps)
+# vendor/
+
+# IDE / editor
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+
+# Local env & secrets — never commit real keys
+.env
+.env.*
+!.env.example
+
