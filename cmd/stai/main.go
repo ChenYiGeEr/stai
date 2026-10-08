@@ -75,9 +75,12 @@ Disable hooks without uninstalling: STAI_DISABLE=1
 
 // cmdGen implements "stai gen": generate a commit message for the staged
 // diff and copy it to the clipboard so it can be pasted into SourceTree.
+// With -edit, the message first shows in an editable macOS dialog; the
+// edited text is what gets copied.
 func cmdGen(args []string) {
 	fs := flag.NewFlagSet("gen", flag.ExitOnError)
 	copyFlag := fs.Bool("copy", true, "copy the generated message to the clipboard")
+	editFlag := fs.Bool("edit", false, "show the message in an editable dialog before copying")
 	fs.Parse(args)
 
 	cfg, err := config.Load()
@@ -92,13 +95,36 @@ func cmdGen(args []string) {
 		Language: cfg.Commit.Language,
 		Diff:     diff,
 		MaxChars: maxDiffChars,
+		Retries:  1,
 	})
 	fatal(err)
 
+	if *editFlag {
+		edited, ok := dialogEdit(msg)
+		if !ok {
+			return // user cancelled: copy nothing
+		}
+		msg = edited
+	}
 	if *copyFlag && copyToClipboard(msg) == nil {
 		fmt.Fprintln(os.Stderr, "copied to clipboard")
 	}
 	fmt.Println(msg)
+}
+
+// dialogEdit shows the generated message in an editable macOS dialog. It
+// returns the edited text, or ok=false when the user cancels or the dialog
+// fails (never block the workflow because of a UI hiccup).
+func dialogEdit(msg string) (edited string, ok bool) {
+	script := `on run argv
+	return text returned of (display dialog "可编辑,确定后复制到剪贴板" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
+end run`
+	cmd := exec.Command("osascript", "-e", script, "--", msg)
+	out, err := cmd.Output()
+	if err != nil {
+		return "", false // -128 = user cancelled
+	}
+	return strings.TrimRight(string(out), "\n"), true
 }
 
 // cmdHook implements "stai hook prepare-commit-msg": fill in a generated
@@ -150,6 +176,7 @@ func cmdHook(args []string) {
 		Language: cfg.Commit.Language,
 		Diff:     diff,
 		MaxChars: maxDiffChars,
+		Retries:  1,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stai: commit message generation failed, committing as-is: %v\n", err)
@@ -193,7 +220,7 @@ func cmdInstall(args []string) {
 Add it manually: SourceTree → Settings → Custom Actions → Add:
   Menu caption:  AI 生成提交信息
   Script to run: %s
-  Parameters:    gen
+  Parameters:    gen --edit
 Then run "stai gen" in the repo (it copies the message for the commit box).
 `, err, exe)
 		return
@@ -201,20 +228,50 @@ Then run "stai gen" in the repo (it copies the message for the commit box).
 	fmt.Println("SourceTree custom action registered: AI 生成提交信息 (restart SourceTree)")
 }
 
+const sourceTreeDomain = "com.torusknot.SourceTreeNotMAS"
+
 // installSourceTreeAction registers the custom action in SourceTree's
 // preferences. The entry schema (name/command/parameters + has*Param flags)
-// was recovered from the Sourcetree 4.2.19 binary.
+// was recovered from the Sourcetree 4.2.19 binary. Re-running replaces the
+// previous stai entry (older binary path or outdated parameters), but never
+// touches custom actions created outside stai.
 func installSourceTreeAction(exe string) error {
 	dict := fmt.Sprintf(`{
 		name = "AI 生成提交信息";
 		command = "%s";
-		parameters = "gen";
+		parameters = "gen --edit";
 		hasFileParam = 0;
 		hasRepoParam = 1;
 		hasSHAParam = 0;
 	}`, exe)
-	cmd := exec.Command("defaults", "write", "com.torusknot.SourceTreeNotMAS",
-		"customActions", "-array-add", dict)
+
+	if out, err := exec.Command("defaults", "read", sourceTreeDomain, "customActions").Output(); err == nil {
+		// Drop every entry that already points at this stai binary (a stale
+		// duplicate can survive when SourceTree rewrites its cached prefs
+		// while running). Refuse to touch entries owned by other tools.
+		ours, foreign := 0, 0
+		for _, line := range strings.Split(string(out), "\n") {
+			line = strings.TrimSpace(line)
+			if !strings.HasPrefix(line, "command =") {
+				continue
+			}
+			if strings.Contains(line, exe) {
+				ours++
+			} else {
+				foreign++
+			}
+		}
+		if foreign > 0 {
+			return fmt.Errorf("customActions has entries from other tools; update the stai one manually")
+		}
+		if ours > 0 {
+			if err := exec.Command("defaults", "delete", sourceTreeDomain, "customActions").Run(); err != nil {
+				return fmt.Errorf("defaults delete: %w", err)
+			}
+		}
+	}
+
+	cmd := exec.Command("defaults", "write", sourceTreeDomain, "customActions", "-array-add", dict)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("defaults write: %v: %s", err, strings.TrimSpace(string(out)))
