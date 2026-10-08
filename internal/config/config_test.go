@@ -55,6 +55,34 @@ func TestLoadFileRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestLoadFileStripsTrailingComments(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[provider]
+base_url = "http://localhost:11434/v1"   # 默认本机 Ollama
+api_key  = ""                             # 本地模型留空
+model    = "qwen2.5-coder:7b"             # 含 # 的字符串要保留 http://x/#y
+
+[review]
+strict = false                            # trailing comment
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	if err := loadFile(&cfg, path); err != nil {
+		t.Fatalf("trailing comments must be accepted: %v", err)
+	}
+	if cfg.Provider.BaseURL != "http://localhost:11434/v1" || cfg.Provider.Model != "qwen2.5-coder:7b" {
+		t.Errorf("values with trailing comments mis-parsed: %+v", cfg.Provider)
+	}
+	if cfg.Review.Strict {
+		t.Errorf("strict should stay false")
+	}
+}
+
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("STAI_BASE_URL", "http://example:9999/v1")
 	t.Setenv("STAI_MODEL", "env-model")

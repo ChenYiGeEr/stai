@@ -103,7 +103,8 @@ func loadFile(cfg *Config, path string) error {
 	sc := bufio.NewScanner(f)
 	for lineNo := 1; sc.Scan(); lineNo++ {
 		line := strings.TrimSpace(sc.Text())
-		if line == "" || strings.HasPrefix(line, "#") {
+		line = stripComment(line)
+		if line == "" {
 			continue
 		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
@@ -119,6 +120,28 @@ func loadFile(cfg *Config, path string) error {
 		}
 	}
 	return sc.Err()
+}
+
+// stripComment removes a trailing # comment, leaving # inside quoted strings
+// untouched (URLs and messages may legitimately contain it).
+func stripComment(s string) string {
+	var quote byte
+	for i := 0; i < len(s); i++ {
+		c := s[i]
+		if quote != 0 {
+			if c == quote {
+				quote = 0
+			}
+			continue
+		}
+		switch c {
+		case '"', '\'':
+			quote = c
+		case '#':
+			return strings.TrimSpace(s[:i])
+		}
+	}
+	return s
 }
 
 func set(cfg *Config, section, key, raw string) error {
