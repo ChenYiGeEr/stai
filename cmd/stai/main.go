@@ -6,6 +6,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"flag"
 	"fmt"
@@ -86,7 +87,7 @@ func cmdGen(args []string) {
 	cfg, err := config.Load()
 	fatal(err)
 	logPath = cfg.Log.Path
-	logf("gen start args=%q", args)
+	logf("gen start args=%q model=%s base_url=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL)
 
 	// SourceTree custom actions append $REPO (the repository path) to the
 	// parameters; the plain CLI passes nothing and uses the current dir.
@@ -114,13 +115,13 @@ func cmdGen(args []string) {
 	// The clipboard is the delivery channel; the notification is the only
 	// visible feedback because SourceTree custom actions discard stdout.
 	logf("gen repo=%s message=%q", repoDir, msg)
-	if err := copyToClipboard(msg); err != nil {
-		logf("gen clipboard copy failed: %v", err)
+	if err := writeClipboard(msg); err != nil {
+		logf("gen clipboard write failed: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
 		return
 	}
-	logf("gen copied")
 	notifyCopied(cfg.Notify, msg)
+	logClipboard("exit", msg)
 	fmt.Fprintln(os.Stderr, "copied to clipboard")
 	fmt.Println(msg)
 }
@@ -312,11 +313,49 @@ const actionPlistJXA = `function run(argv) {
 	return 'actions.plist now has ' + kept.count + ' entries';
 }`
 
-func copyToClipboard(s string) error {
-	cmd := exec.Command("pbcopy")
-	cmd.Stdin = strings.NewReader(s)
-	return cmd.Run()
+// writeClipboard puts msg on the pasteboard and verifies it by reading it
+// back. pbcopy is tried first; if it reports success but the pasteboard does
+// not hold msg (seen when stai runs under SourceTree), the message is written
+// through NSPasteboard via osascript. Every step is logged.
+func writeClipboard(msg string) error {
+	before, berr := pasteboardChangeCount()
+	logf("gen clipboard before-write changeCount=%s err=%v", before, berr)
+
+	var stderr bytes.Buffer
+	cmd := utf8Cmd("pbcopy")
+	cmd.Stdin = strings.NewReader(msg)
+	cmd.Stderr = &stderr
+	perr := cmd.Run()
+	logf("gen clipboard pbcopy err=%v stderr=%q", perr, stderr.String())
+
+	if got, _ := clipboardText(); got == msg {
+		logf("gen clipboard written via pbcopy")
+		return nil
+	}
+
+	cmd = utf8Cmd("osascript", "-l", "JavaScript", "-e", pasteboardWriteJXA, "--", msg)
+	stderr.Reset()
+	cmd.Stderr = &stderr
+	oerr := cmd.Run()
+	logf("gen clipboard NSPasteboard fallback err=%v stderr=%q", oerr, stderr.String())
+
+	got, _ := clipboardText()
+	if got != msg {
+		return fmt.Errorf("pasteboard does not hold the message after both pbcopy and NSPasteboard (pbcopy err=%v, fallback err=%v)", perr, oerr)
+	}
+	logf("gen clipboard written via NSPasteboard fallback")
+	return nil
 }
+
+// pasteboardWriteJXA clears the general pasteboard and sets argv[0] as its
+// plain-text content.
+const pasteboardWriteJXA = `function run(argv) {
+	ObjC.import('AppKit');
+	var pb = $.NSPasteboard.generalPasteboard;
+	pb.clearContents;
+	pb.setStringForType($(argv[0]), $.NSPasteboardTypeString);
+	return 'ok';
+}`
 
 // notifyCopied surfaces the generated message in a macOS notification —
 // SourceTree custom actions swallow stdout, so without it the user would
@@ -326,7 +365,7 @@ func notifyCopied(n config.Notify, msg string) {
 	script := `on run argv
 	display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
 end run`
-	cmd := exec.Command("osascript", "-e", script, "--", msg, n.Title, n.Subtitle)
+	cmd := utf8Cmd("osascript", "-e", script, "--", msg, n.Title, n.Subtitle)
 	_ = cmd.Run()
 }
 
@@ -380,5 +419,39 @@ func logf(format string, args ...any) {
 	}
 	defer f.Close()
 	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+
+// utf8Cmd builds a command that runs with a UTF-8 locale. SourceTree starts
+// custom actions without one: pbcopy then writes an empty pasteboard, and
+// pbpaste and osascript mangle non-ASCII text, so stai's own read-back check
+// would fail even when the write was fine.
+func utf8Cmd(name string, args ...string) *exec.Cmd {
+	cmd := exec.Command(name, args...)
+	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_CTYPE=en_US.UTF-8")
+	return cmd
+}
+
+func clipboardText() (string, error) {
+	out, err := utf8Cmd("pbpaste").Output()
+	return string(out), err
+}
+
+// pasteboardChangeCount returns the general pasteboard's changeCount, which
+// increments on every write by any process. A change between two checks
+// means something else wrote to the clipboard in between.
+func pasteboardChangeCount() (string, error) {
+	out, err := utf8Cmd("osascript", "-l", "JavaScript", "-e",
+		"ObjC.import('AppKit'); $.NSPasteboard.generalPasteboard.changeCount").Output()
+	return strings.TrimSpace(string(out)), err
+}
+
+// logClipboard records whether the clipboard still holds want, and the
+// pasteboard changeCount, at a named point of the run. Used to tell whether
+// the clipboard was emptied after stai wrote to it.
+func logClipboard(tag, want string) {
+	got, err := clipboardText()
+	count, cerr := pasteboardChangeCount()
+	logf("gen clipboard %s match=%v changeCount=%s got=%q err=%v countErr=%v",
+		tag, got == want, count, got, err, cerr)
 }
 
