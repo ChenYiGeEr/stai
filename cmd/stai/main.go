@@ -130,13 +130,16 @@ func cmdGen(args []string) {
 	fmt.Println(msg)
 }
 
-// fillSourceTreeCommitBox writes msg into the commit message field of the
+// fillSourceTreeCommitBox pastes msg into the commit message field of the
 // repo's SourceTree window via Accessibility scripting — the only channel
-// SourceTree offers, since it has no plugin or scripting API (verified on
-// Sourcetree 4.2.19: the field is an AXTextField whose role description is
-// the plain "文本栏", as opposed to "搜索文本栏"). Requires the macOS
-// Accessibility permission for the stai binary; any error is returned so
-// the caller can fall back to the clipboard.
+// SourceTree offers, since it has no plugin or scripting API. The real
+// editor is an AXTextArea (an empty box may surface as an AXTextField);
+// writing AXValue only paints the control, so the message evaporates the
+// moment the field gains focus — pasting through the clipboard updates
+// SourceTree's internal model and survives (verified on Sourcetree
+// 4.2.19). Requires the macOS Accessibility permission for the stai
+// binary; any error is returned so the caller can fall back to the
+// clipboard.
 func fillSourceTreeCommitBox(repoName, msg string) error {
 	cmd := exec.Command("osascript", "-e", fillCommitBoxScript, "--", msg, repoName)
 	out, err := cmd.CombinedOutput()
@@ -146,31 +149,93 @@ func fillSourceTreeCommitBox(repoName, msg string) error {
 	return nil
 }
 
-// fillCommitBoxScript: argv = commit message, repo folder name. Matches
-// the window whose title contains the repo name, finds the commit message
-// text field deep in the AX tree, writes msg and verifies the readback.
+// fillCommitBoxScript: argv = commit message, repo folder name. Switches to
+// the file status view, focuses the commit message field with a real click
+// and pastes msg through the clipboard (the only write that survives focus
+// changes), then restores the previous clipboard and moves the cursor to
+// the end of the pasted text.
 const fillCommitBoxScript = `on run argv
 	set msg to item 1 of argv
 	set repoName to item 2 of argv
+	set oldClip to ""
+	try
+		set oldClip to the clipboard
+	end try
 	tell application "Sourcetree" to activate
+	delay 0.3
 	tell application "System Events"
 		tell process "Sourcetree"
 			set wins to every window whose name contains repoName
 			if (count of wins) is 0 then error "no SourceTree window for " & repoName
-			set els to entire contents of item 1 of wins
-			repeat with el in els
-				try
-					if role of el is "AXTextField" and role description of el is "文本栏" then
-						set value of el to msg
-						if value of el does not contain msg then error "write did not stick"
-						return "ok"
-					end if
-				end try
-			end repeat
-			error "commit message field not found"
+			perform action "AXRaise" of item 1 of wins
+			delay 0.2
+			-- the commit box only lives in the file status view; switching is
+			-- idempotent, so do it every time rather than trusting the state
+			try
+				click menu item "文件状态视图" of menu 1 of menu bar item "查看" of menu bar 1
+			end try
 		end tell
 	end tell
-end run`
+	delay 0.8
+	set box to my findCommitBox(repoName)
+	if box is missing value then error "commit message field not found"
+	set the clipboard to msg
+	tell application "System Events" to click box
+	delay 0.3
+	tell application "System Events" to keystroke "v" using command down
+	delay 0.5
+	if my boxValue(repoName) does not contain msg then
+		my restoreClipboard(oldClip)
+		error "paste did not stick"
+	end if
+	my restoreClipboard(oldClip)
+	-- the paste lands fully selected; collapse the selection so an
+	-- accidental keystroke cannot wipe the whole message
+	tell application "System Events" to key code 124
+	return "ok"
+end run
+
+on restoreClipboard(oldClip)
+	try
+		if oldClip is not "" then set the clipboard to oldClip
+	end try
+end restoreClipboard
+
+-- entire-contents references go stale quickly, so the box is re-located
+-- before every interaction; the real editor is an AXTextArea, with an
+-- AXTextField as the empty-box fallback
+on findCommitBox(repoName)
+	tell application "System Events"
+		tell process "Sourcetree"
+			set wins to every window whose name contains repoName
+			if (count of wins) is 0 then return missing value
+			set fallback to missing value
+			repeat with el in (get entire contents of item 1 of wins)
+				try
+					if class of el is text area then return el
+					if class of el is text field then set fallback to el
+				end try
+			end repeat
+			return fallback
+		end tell
+	end tell
+	return missing value
+end findCommitBox
+
+on boxValue(repoName)
+	tell application "System Events"
+		tell process "Sourcetree"
+			set wins to every window whose name contains repoName
+			if (count of wins) is 0 then return ""
+			repeat with el in (get entire contents of item 1 of wins)
+				try
+					if class of el is text area then return value of el as text
+				end try
+			end repeat
+		end tell
+	end tell
+	return ""
+end boxValue`
 
 // dialogEdit shows the generated message in an editable macOS dialog. It
 // returns the edited text, or ok=false when the user cancels or the dialog
@@ -280,8 +345,9 @@ func cmdInstall(args []string) {
 Add it manually: SourceTree → Settings → Custom Actions → Add:
   Menu caption:  AI 生成提交信息
   Script to run: %s
-  Parameters:    gen --edit $REPO
-Then run "stai gen" in the repo (it copies the message for the commit box).
+  Parameters:    gen $REPO
+Then run "stai gen" in the repo (it fills the message into the commit box,
+falling back to the clipboard).
 `, err, exe)
 		return
 	}
@@ -302,7 +368,7 @@ const actionCaption = "AI 生成提交信息"
 // the file; entries owned by other tools are preserved.
 func installSourceTreeAction(exe string) error {
 	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", actionPlistJXA,
-		"--", exe, actionCaption, "gen --edit $REPO")
+		"--", exe, actionCaption, "gen $REPO")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("updating actions.plist: %v: %s", err, strings.TrimSpace(string(out)))
@@ -312,7 +378,8 @@ func installSourceTreeAction(exe string) error {
 
 // actionPlistJXA deduplicates and appends the stai entry in actions.plist.
 // argv: exe path, menu caption, parameters ($REPO is expanded by SourceTree
-// to the repository path at run time).
+// to the repository path at run time). The action runs "gen" directly — no
+// dialog — because review and edits happen in the commit box itself.
 const actionPlistJXA = `function run(argv) {
 	ObjC.import('Foundation');
 	var exe = argv[0], caption = argv[1], params = argv[2];
