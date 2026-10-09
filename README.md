@@ -54,7 +54,8 @@ stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 2. 向 SourceTree 的自定义操作存储写入条目：
    `~/Library/Application Support/SourceTree/actions.plist`（NSKeyedArchiver
    格式，schema 取自 4.2.19 实机生成的条目），菜单项 **AI 生成提交信息**，
-   参数 `gen --edit $REPO`（SourceTree 会把 `$REPO` 展开为仓库路径传入）。
+   参数 `gen --edit $REPO`（SourceTree 会把 `$REPO` 展开为仓库路径传入），
+   快捷键 **⌥G**（安装后可在 SourceTree 设置 → 自定义操作中自行修改）。
 
 该操作是幂等的：重复执行会替换指向本二进制或同名的旧条目，其他工具
 创建的条目原样保留。

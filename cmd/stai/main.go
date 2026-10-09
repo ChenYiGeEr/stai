@@ -346,9 +346,9 @@ const actionPlistJXA = `function run(argv) {
 	e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
 	e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
 	e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
-	e.setObjectForKey($.NSNumber.numberWithInt(-1), 'shortcutKeyCode');
-	e.setObjectForKey($.NSNumber.numberWithInt(0), 'shortcutKeyModifiers');
-	e.setObjectForKey('', 'shortcutKeyDisplay');
+	e.setObjectForKey($.NSNumber.numberWithInt(5), 'shortcutKeyCode');       // kVK_ANSI_G
+	e.setObjectForKey($.NSNumber.numberWithInt(524288), 'shortcutKeyModifiers'); // NSEvent.ModifierFlags.option
+	e.setObjectForKey('⌥G', 'shortcutKeyDisplay');
 	kept.addObject(e);
 	var out = $.NSKeyedArchiver.archivedDataWithRootObject(kept);
 	if (!out.writeToFileAtomically(path, true)) throw Error('write failed: ' + path);
