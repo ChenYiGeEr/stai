@@ -1,8 +1,10 @@
 package ai
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -268,6 +270,301 @@ func TestGenerateCommitNoRetryWhenValid(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Errorf("valid first reply must not be retried, got %d calls", calls)
+	}
+}
+
+func TestParseReview(t *testing.T) {
+	findings, bad := parseReview(`[high] internal/ai/ai.go:102 - err 被覆盖,读取错误会丢失
+[low] cmd/stai/main.go:40 - 超时常量重复定义
+
+OK 以外的内容不应出现这里也不会解析`)
+	if len(findings) != 2 || len(bad) != 1 {
+		t.Fatalf("findings=%d bad=%d, want 2/1", len(findings), len(bad))
+	}
+	if findings[0].Severity != "high" || findings[0].Location != "internal/ai/ai.go:102" {
+		t.Errorf("first finding mis-parsed: %+v", findings[0])
+	}
+	if findings[1].Severity != "low" || findings[1].Location != "cmd/stai/main.go:40" {
+		t.Errorf("second finding mis-parsed: %+v", findings[1])
+	}
+	if !HasHigh(findings) {
+		t.Errorf("HasHigh must be true with a high finding")
+	}
+}
+
+func TestParseReviewOK(t *testing.T) {
+	for _, s := range []string{"OK", "ok", "OK\n", "无问题"} {
+		findings, bad := parseReview(s)
+		if len(findings) != 0 || len(bad) != 0 {
+			t.Errorf("parseReview(%q) = %d findings, %d bad; want none", s, len(findings), len(bad))
+		}
+	}
+}
+
+func TestGenerateReview(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(reply("[medium] cmd/stai/main.go:88 - 错误未检查"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: []byte("diff --git a/x b/x\n+line"), Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Severity != "medium" {
+		t.Fatalf("findings = %+v", findings)
+	}
+	if HasHigh(findings) {
+		t.Errorf("HasHigh must be false without a high finding")
+	}
+}
+
+func TestGenerateReviewRetriesThenAdvises(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		content := "我看这个 diff 没什么问题,挺好的" // unparseable prose
+		if calls == 2 {
+			content = "[high] a/b.go:1 - 空指针解引用"
+		}
+		json.NewEncoder(w).Encode(reply(content))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: []byte("diff --git a/x b/x\n+line"), Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 1 retry (2 calls), got %d", calls)
+	}
+	if !HasHigh(findings) {
+		t.Errorf("high finding lost after retry: %+v", findings)
+	}
+}
+
+func TestGenerateReviewUnparsedBecomesAdvisory(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode(reply("这段代码整体不错,但错误处理可以更细致一些"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: []byte("diff --git a/x b/x\n+line"), Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 1 || findings[0].Severity != "" || findings[0].Message == "" {
+		t.Fatalf("unparsed reply must become one advisory finding, got %+v", findings)
+	}
+	if HasHigh(findings) {
+		t.Errorf("an unparsed line must never count as high severity")
+	}
+}
+
+func TestGroupDiff(t *testing.T) {
+	// Three files, two changed lines each (added+deleted pairs).
+	diff := []byte("diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n@@ -1 +1,2 @@\n+one\n+two\n" +
+		"diff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n@@ -1 +1,2 @@\n-old\n+new\n" +
+		"diff --git a/c.txt b/c.txt\n--- a/c.txt\n+++ b/c.txt\n@@ -1 +1,2 @@\n+x\n+y\n")
+
+	if g := groupDiff(diff, 0); len(g) != 1 {
+		t.Errorf("maxLines=0: got %d groups, want 1", len(g))
+	}
+	if g := groupDiff(diff, 2); len(g) != 3 {
+		t.Errorf("maxLines=2: got %d groups, want 3 (one file each)", len(g))
+	}
+	if g := groupDiff(diff, 4); len(g) != 2 {
+		t.Errorf("maxLines=4: got %d groups, want 2", len(g))
+	}
+	if g := groupDiff(diff, 1000); len(g) != 1 {
+		t.Errorf("maxLines=1000: got %d groups, want 1", len(g))
+	}
+	// File headers must not count as changed lines.
+	if g := groupDiff(diff, 3); len(g) != 3 {
+		t.Errorf("maxLines=3: got %d groups, want 3 (headers excluded)", len(g))
+	}
+}
+
+func TestGroupDiffKeepsOversizedFileWhole(t *testing.T) {
+	var big strings.Builder
+	big.WriteString("diff --git a/big.go b/big.go\n--- a/big.go\n+++ b/big.go\n")
+	for i := 0; i < 50; i++ {
+		fmt.Fprintf(&big, "+line%d\n", i)
+	}
+	groups := groupDiff([]byte(big.String()), 10)
+	if len(groups) != 1 {
+		t.Fatalf("single oversized file: got %d groups, want 1 (file stays whole)", len(groups))
+	}
+	if !bytes.Equal(groups[0], []byte(big.String())) {
+		t.Errorf("single oversized file must not be truncated by grouping")
+	}
+}
+
+func TestSplitDiffFilesHeadersKept(t *testing.T) {
+	diff := "diff --git a/a.go b/a.go\n--- a/a.go\n+++ b/a.go\n+x\ndiff --git a/b.go b/b.go\n--- a/b.go\n+++ b/b.go\n+y\n"
+	chunks := splitDiffFiles([]byte(diff))
+	if len(chunks) != 2 {
+		t.Fatalf("got %d chunks, want 2", len(chunks))
+	}
+	for i, want := range []string{"a.go", "b.go"} {
+		if !strings.HasPrefix(string(chunks[i]), "diff --git a/"+want) {
+			t.Errorf("chunk %d does not start with its %s header: %q", i, want, chunks[i][:20])
+		}
+	}
+}
+
+func TestReviewPromptAssembly(t *testing.T) {
+	p := reviewPrompt([]string{"规则一"}, true)
+	if !strings.Contains(p, "Go 专项关注点") || !strings.Contains(p, "规则一") {
+		t.Errorf("rules and Go checklist missing from prompt:\n%s", p)
+	}
+	if !strings.Contains(p, "精确优先于召回") {
+		t.Errorf("precision-over-recall principle missing from base prompt")
+	}
+	p = reviewPrompt(nil, false)
+	if strings.Contains(p, "Go 专项关注点") || strings.Contains(p, "项目附加规则") {
+		t.Errorf("prompt must stay bare without Go files or rules:\n%s", p)
+	}
+}
+
+func TestGenerateReviewGrouped(t *testing.T) {
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		content := "[low] a/a.go:1 - a 的小问题"
+		if calls == 2 {
+			content = "[high] b/b.go:2 - b 的高危问题"
+		}
+		json.NewEncoder(w).Encode(reply(content))
+	}))
+	defer srv.Close()
+
+	diff := []byte("diff --git a/a/a.go b/a/a.go\n--- a/a/a.go\n+++ b/a/a.go\n@@ -1 +1,2 @@\n+x\n+y\n" +
+		"diff --git a/b/b.go b/b/b.go\n--- a/b/b.go\n+++ b/b/b.go\n@@ -1 +1,2 @@\n+z\n+w\n")
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: diff, GroupMaxLines: 2, Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 2 {
+		t.Errorf("expected 2 group calls, got %d", calls)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("findings = %+v", findings)
+	}
+	if findings[0].Severity != "high" || findings[1].Severity != "low" {
+		t.Errorf("findings must be sorted high first: %+v", findings)
+	}
+}
+
+func TestHasGoFiles(t *testing.T) {
+	if !hasGoFiles([]byte("diff --git a/x.go b/x.go\n--- a/x.go\n+++ b/x.go\n+x")) {
+		t.Errorf(".go chunk not detected")
+	}
+	if hasGoFiles([]byte("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+x")) {
+		t.Errorf("non-Go chunk misdetected")
+	}
+}
+
+func TestChatSendsConfiguredTemperature(t *testing.T) {
+	var got float64 = -1
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		got = req.Temperature
+		json.NewEncoder(w).Encode(reply("OK"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	c.Temperature = 1 // e.g. a model that rejects anything but 1
+	if _, err := c.Chat(context.Background(), "s", "u"); err != nil {
+		t.Fatal(err)
+	}
+	if got != 1 {
+		t.Errorf("request temperature = %v, want 1", got)
+	}
+}
+
+func TestGenerateReviewRetryAccumulates(t *testing.T) {
+	// Round 1: one valid finding + one unparsable line. Round 2: the model
+	// answers the feedback with ONLY the corrected line (partial re-emit) —
+	// round-1 findings must survive.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		content := "[high] a/a.go:1 - 空指针解引用\n这段是模型啰嗦的散文,不是 finding"
+		if calls == 2 {
+			content = "[medium] b/b.go:2 - 错误未检查"
+		}
+		json.NewEncoder(w).Encode(reply(content))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: []byte("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+a"), Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("retry must keep round-1 findings, got %+v", findings)
+	}
+	if !HasHigh(findings) {
+		t.Errorf("high finding from round 1 lost: %+v", findings)
+	}
+}
+
+func TestGenerateReviewRetryDedupsFullReemit(t *testing.T) {
+	// Round 2 re-emits everything including the round-1 finding — it must
+	// not appear twice.
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		content := "[high] a/a.go:1 - 空指针解引用\n散文不是 finding"
+		if calls == 2 {
+			content = "[high] a/a.go:1 - 空指针解引用\n[low] c/c.go:3 - 命名不佳"
+		}
+		json.NewEncoder(w).Encode(reply(content))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: []byte("diff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n+a"), Retries: 1,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("full re-emit must dedup, got %+v", findings)
+	}
+}
+
+func TestSortFindingsAdvisoryLast(t *testing.T) {
+	findings := []Finding{
+		{Severity: "", Message: "advisory"},
+		{Severity: "low"},
+		{Severity: "high"},
+	}
+	sortFindings(findings)
+	want := []string{"high", "low", ""}
+	for i, w := range want {
+		if findings[i].Severity != w {
+			t.Fatalf("order = %q, want %q first", findings[i].Severity, w)
+		}
 	}
 }
 

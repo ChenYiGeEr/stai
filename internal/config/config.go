@@ -16,10 +16,11 @@ import (
 )
 
 type Provider struct {
-	BaseURL    string
-	APIKey     string
-	Model      string
-	TimeoutSec int // HTTP timeout for one chat completion request
+	BaseURL     string
+	APIKey      string
+	Model       string
+	TimeoutSec  int     // HTTP timeout for one chat completion request
+	Temperature float64 // request temperature; 0 = deterministic
 }
 
 type Commit struct {
@@ -35,7 +36,17 @@ type Commit struct {
 }
 
 type Review struct {
-	Strict bool // true: pre-commit blocks on high-severity findings
+	Strict            bool     // true: pre-commit blocks on high-severity findings
+	NotifyMaxFindings int      // findings beyond this go to the report file, not the notification
+	ReportPath        string   // full report location, relative to the repo root
+	GroupMaxLines     int      // diff is reviewed in per-file groups whose changed lines stay under this
+	Rules             []string // project-specific rules injected into the review prompt
+	// Optional provider overrides; empty fields inherit [provider]. Lets
+	// review use a stronger model than gen while gen stays on a fast one.
+	BaseURL     string
+	APIKey      string
+	Model       string
+	Temperature *float64 // nil inherits provider.temperature (some models only accept 1)
 }
 
 type Hook struct {
@@ -48,10 +59,14 @@ type Notify struct {
 }
 
 type SourceTree struct {
-	ActionCaption     string // menu caption of the custom action
-	ShortcutKeyCode   int    // kVK code of the shortcut key (5 = G)
-	ShortcutModifiers int    // NSEvent modifier flags (524288 = Option)
-	ShortcutDisplay   string // shortcut text shown in SourceTree
+	ActionCaption           string // menu caption of the gen custom action
+	ShortcutKeyCode         int    // kVK code of the gen shortcut key (5 = G)
+	ShortcutModifiers       int    // NSEvent modifier flags (524288 = Option)
+	ShortcutDisplay         string // gen shortcut text shown in SourceTree
+	ReviewActionCaption     string // menu caption of the review custom action
+	ReviewShortcutKeyCode   int    // kVK code of the review shortcut key (15 = R)
+	ReviewShortcutModifiers int    // NSEvent modifier flags (524288 = Option)
+	ReviewShortcutDisplay   string // review shortcut text shown in SourceTree
 }
 
 type Log struct {
@@ -88,17 +103,26 @@ func Default() Config {
 			MaxDiffChars: 60000,
 			Retries:      1,
 		},
-		Review: Review{Strict: false},
-		Hook:   Hook{TimeoutSec: 120},
+		Review: Review{
+			Strict:            false,
+			NotifyMaxFindings: 5,
+			ReportPath:        ".git/stai-review.md",
+			GroupMaxLines:     100,
+		},
+		Hook: Hook{TimeoutSec: 120},
 		Notify: Notify{
 			Title:    "stai",
 			Subtitle: "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框",
 		},
 		SourceTree: SourceTree{
-			ActionCaption:     "AI 生成提交信息",
-			ShortcutKeyCode:   5,
-			ShortcutModifiers: 524288,
-			ShortcutDisplay:   "⌥G",
+			ActionCaption:           "AI 生成提交信息",
+			ShortcutKeyCode:         5,
+			ShortcutModifiers:       524288,
+			ShortcutDisplay:         "⌥G",
+			ReviewActionCaption:     "AI 审查改动",
+			ReviewShortcutKeyCode:   15, // kVK_ANSI_R
+			ReviewShortcutModifiers: 524288,
+			ReviewShortcutDisplay:   "⌥R",
 		},
 		Log: Log{Path: filepath.Join(home, "Library", "Logs", "stai.log")},
 	}
@@ -140,6 +164,9 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Commit.Retries < 0 || cfg.Commit.MaxDiffChars < 0 {
 		return errors.New("commit.retries and commit.max_diff_chars must not be negative")
+	}
+	if cfg.Provider.Temperature < 0 || (cfg.Review.Temperature != nil && *cfg.Review.Temperature < 0) {
+		return errors.New("temperature must not be negative")
 	}
 	return nil
 }
@@ -223,6 +250,8 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setString(raw, &cfg.Provider.Model)
 	case "provider.timeout_seconds":
 		err = setInt(raw, &cfg.Provider.TimeoutSec)
+	case "provider.temperature":
+		err = setFloat(raw, &cfg.Provider.Temperature)
 	case "commit.style":
 		err = setString(raw, &cfg.Commit.Style)
 	case "commit.language":
@@ -243,6 +272,22 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.Commit.Retries)
 	case "review.strict":
 		err = setBool(raw, &cfg.Review.Strict)
+	case "review.notify_max_findings":
+		err = setInt(raw, &cfg.Review.NotifyMaxFindings)
+	case "review.report_path":
+		err = setString(raw, &cfg.Review.ReportPath)
+	case "review.group_max_lines":
+		err = setInt(raw, &cfg.Review.GroupMaxLines)
+	case "review.rules":
+		err = setStrings(raw, &cfg.Review.Rules)
+	case "review.base_url":
+		err = setString(raw, &cfg.Review.BaseURL)
+	case "review.api_key":
+		err = setString(raw, &cfg.Review.APIKey)
+	case "review.model":
+		err = setString(raw, &cfg.Review.Model)
+	case "review.temperature":
+		err = setFloatPtr(raw, &cfg.Review.Temperature)
 	case "hook.timeout_seconds":
 		err = setInt(raw, &cfg.Hook.TimeoutSec)
 	case "notify.title":
@@ -257,6 +302,14 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.SourceTree.ShortcutModifiers)
 	case "sourcetree.shortcut_display":
 		err = setString(raw, &cfg.SourceTree.ShortcutDisplay)
+	case "sourcetree.review_action_caption":
+		err = setString(raw, &cfg.SourceTree.ReviewActionCaption)
+	case "sourcetree.review_shortcut_key_code":
+		err = setInt(raw, &cfg.SourceTree.ReviewShortcutKeyCode)
+	case "sourcetree.review_shortcut_modifiers":
+		err = setInt(raw, &cfg.SourceTree.ReviewShortcutModifiers)
+	case "sourcetree.review_shortcut_display":
+		err = setString(raw, &cfg.SourceTree.ReviewShortcutDisplay)
 	case "log.path":
 		var p string
 		if err = setString(raw, &p); err == nil {
@@ -295,6 +348,25 @@ func setInt(raw string, dst *int) error {
 		return fmt.Errorf("expected an integer, got %q", raw)
 	}
 	*dst = n
+	return nil
+}
+
+func setFloat(raw string, dst *float64) error {
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fmt.Errorf("expected a number, got %q", raw)
+	}
+	*dst = f
+	return nil
+}
+
+// setFloatPtr parses a number into a *float64, allocating on first set.
+func setFloatPtr(raw string, dst **float64) error {
+	f, err := strconv.ParseFloat(raw, 64)
+	if err != nil {
+		return fmt.Errorf("expected a number, got %q", raw)
+	}
+	*dst = &f
 	return nil
 }
 

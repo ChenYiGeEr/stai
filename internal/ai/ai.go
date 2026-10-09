@@ -14,6 +14,7 @@ import (
 	"io"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 	"unicode"
@@ -23,11 +24,12 @@ import (
 )
 
 type Client struct {
-	baseURL   string
-	apiKey    string
-	model     string
-	http      *http.Client
-	sessionID string // one per run, so providers can group a conversation
+	baseURL     string
+	apiKey      string
+	model       string
+	http        *http.Client
+	sessionID   string  // one per run, so providers can group a conversation
+	Temperature float64 // request temperature; 0 = deterministic. Some models only accept 1 — set it via config.
 }
 
 func NewClient(baseURL, apiKey, model string, timeout time.Duration) *Client {
@@ -75,7 +77,7 @@ func (c *Client) chat(ctx context.Context, messages []chatMessage) (string, erro
 	body, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Messages:    messages,
-		Temperature: 0, // deterministic: same input -> same output
+		Temperature: c.Temperature,
 		Stream:      false,
 	})
 	if err != nil {
@@ -164,6 +166,317 @@ func (c *Client) GenerateCommit(ctx context.Context, cfg config.Commit, diff []b
 		return "", fmt.Errorf("模型输出仍不合规：%s", reason)
 	}
 	return msg, nil
+}
+
+// Finding is one issue the model found in the staged diff.
+type Finding struct {
+	Severity string // "high", "medium", "low" — "" means an unparsed advisory line
+	Location string // e.g. "internal/ai/ai.go:42"; may be empty
+	Message  string
+}
+
+// HasHigh reports whether any finding is high severity.
+func HasHigh(findings []Finding) bool {
+	for _, f := range findings {
+		if f.Severity == "high" {
+			return true
+		}
+	}
+	return false
+}
+
+// ReviewParams carries everything GenerateReview needs.
+type ReviewParams struct {
+	Diff          []byte
+	MaxChars      int      // truncate each group beyond this, telling the model
+	Retries       int      // parse-retry count per group (0 = validate the first reply only)
+	GroupMaxLines int      // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
+	Rules         []string // project-specific rules appended to the review prompt
+}
+
+var reviewFinding = regexp.MustCompile(`^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*(.+)$`)
+
+// GenerateReview asks the model to review the staged diff and returns the
+// findings. The model must answer with one line per finding in the form
+// "[high|medium|low] path:line - description", or "OK" when there is nothing
+// to report. A reply that does not parse is retried (same conversation, the
+// diff is not resent) with the reason fed back; lines that still do not parse
+// are returned as advisory findings with an empty severity, so a broken
+// reply is shown as advice instead of being dropped or blocking a commit.
+//
+// Large diffs are split into per-file groups (each group's combined changed
+// lines stay under GroupMaxLines) that are reviewed one call at a time —
+// small models miss issues in diffs that dilute their attention, but catch
+// them when shown one file at a time. Findings from all groups are merged
+// and sorted high → low.
+func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding, error) {
+	var all []Finding
+	groups := groupDiff(p.Diff, p.GroupMaxLines)
+	for i, g := range groups {
+		findings, err := c.reviewGroup(ctx, p, g, i+1, len(groups))
+		if err != nil {
+			return nil, err
+		}
+		all = append(all, findings...)
+	}
+	sortFindings(all)
+	return all, nil
+}
+
+// reviewGroup reviews one diff group (a single call, with parse retries).
+func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, num, total int) ([]Finding, error) {
+	diff := string(group)
+	truncated := ""
+	if p.MaxChars > 0 && len(diff) > p.MaxChars {
+		diff = truncateUTF8(diff, p.MaxChars)
+		truncated = "\n(Note: the diff was truncated for length.)"
+	}
+
+	prefix := ""
+	if total > 1 {
+		prefix = fmt.Sprintf("(第 %d/%d 组) ", num, total)
+	}
+	messages := []chatMessage{
+		{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group))},
+		{Role: "user", Content: fmt.Sprintf("%s审查以下暂存 diff:\n\n%s%s", prefix, diff, truncated)},
+	}
+
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return nil, err
+	}
+	findings, bad := parseReview(raw)
+
+	for attempt := 0; len(bad) > 0 && attempt < p.Retries; attempt++ {
+		messages = append(messages,
+			chatMessage{Role: "assistant", Content: raw},
+			chatMessage{Role: "user", Content: fmt.Sprintf(
+				"上次输出无法解析:%q。请完整重新输出全部问题(包括已正确输出的),每条一行,格式为 [high|medium|low] 文件路径:行号 - 问题描述;没有问题就只输出 OK。",
+				strings.Join(bad, " / "))},
+		)
+		raw, err = c.chat(ctx, messages)
+		if err != nil {
+			return nil, err
+		}
+		// Accumulate instead of overwriting: a model may answer the feedback
+		// with only the corrected lines, so round-1 findings must survive.
+		newFindings, newBad := parseReview(raw)
+		findings = mergeFindings(findings, newFindings)
+		bad = newBad
+	}
+	// Still-unparsed lines become advisory findings (empty severity) so the
+	// user still sees them; they never count as high severity.
+	for _, line := range bad {
+		findings = append(findings, Finding{Message: line})
+	}
+	return findings, nil
+}
+
+// reviewPrompt assembles the system prompt: the base principles, a condensed
+// Go checklist when the group touches Go files, and any project rules.
+func reviewPrompt(rules []string, hasGo bool) string {
+	var b strings.Builder
+	b.WriteString(reviewSystemPrompt)
+	if hasGo {
+		b.WriteString("\n\n" + reviewGoChecklist)
+	}
+	if len(rules) > 0 {
+		b.WriteString("\n\n项目附加规则(必须遵守):\n")
+		for _, r := range rules {
+			b.WriteString("- " + r + "\n")
+		}
+	}
+	return b.String()
+}
+
+// reviewSystemPrompt is the base review prompt. The first two principles are
+// borrowed from alibaba/open-code-review: precision beats recall (a false
+// positive costs reviewer trust), and findings that deterministic tooling
+// (gofmt, go vet, Staticcheck, the compiler) can already surface are not
+// reported.
+const reviewSystemPrompt = `你是提交前 code review 审查器。严格遵守以下规则:
+1. 精确优先于召回:只报告你能在 diff 及其上下文中确认的缺陷,不要猜测,不要报告风格偏好。误报会消耗审阅者的信任。
+2. 不报告确定性工具能发现的问题:格式、未使用的变量/导入、编译器或 go vet、Staticcheck、gofmt 能查出的静态问题一律不报。
+3. 只报告确实存在的问题:缺陷、安全隐患、逻辑错误、明显的性能问题。
+4. 每条问题一行,格式为 [high|medium|low] 文件路径:行号 - 问题描述。high 仅用于会导致缺陷、数据丢失或安全漏洞的问题。
+5. 问题描述用中文,一行一条,简短具体,指出改什么。
+6. 没有任何问题时只输出 OK,不要输出其他任何内容。
+7. 不要解释、不要代码围栏、不要任何前言或后缀。
+
+示例(有 2 条问题):
+[high] internal/ai/ai.go:102 - err 被覆盖,底层的读取错误会丢失
+[low] cmd/stai/main.go:40 - 超时常量重复定义了两次
+
+示例(无问题):
+OK`
+
+// reviewGoChecklist is a condensed, model-sized version of the Go review
+// principles from alibaba/open-code-review (internal/config/rules/rule_docs
+// /go.md). The original assumes a cloud model with file_read/code_search
+// tool access and would dilute a small local model, so only the
+// diff-observable highlights are kept.
+const reviewGoChecklist = `Go 专项关注点(只报确实存在于改动中的问题):
+- 错误:被忽略或覆盖的错误;该保留 errors.Is/As 可判性时用了 %v;请求/库路径上的 panic 或 log.Fatal
+- nil:nil map 写入会 panic;nil channel 收发永久阻塞;typed nil 存入接口后判空失效;构造函数或输入可达的指针未判空就解引用
+- context:该继承调用者取消链/超时时用了 context.Background();WithCancel/Timeout 的 cancel 用完未调用
+- goroutine:可能永久阻塞且无人能退出的 goroutine;闭包捕获循环变量或请求期的可变数据
+- 并发:map/slice/字段的无锁并发读写;持锁做阻塞 I/O;channel 可能重复 close 或向已关闭 channel 发送
+- 资源:文件/response.Body/rows 并非所有路径都关闭;循环内 defer 使资源延迟到函数返回才释放
+- 边界:切片/数组索引在空输入或边界输入时越界;整型转换溢出或负数转无符号变成巨大值
+- 安全:SQL/命令/路径由不可信输入拼接;math/rand 用于安全敏感随机数;密钥或凭据写入日志/错误信息`
+
+// groupDiff splits a diff into review groups: each file becomes a chunk
+// (split on "diff --git" headers), chunks are batched into groups whose
+// combined changed-line count (added + removed, excluding file headers)
+// stays <= maxLines. A single file always stays whole, even when it alone
+// exceeds maxLines. maxLines <= 0, an unparseable diff, or a diff that fits
+// in one group yields a single group.
+func groupDiff(diff []byte, maxLines int) [][]byte {
+	if maxLines <= 0 {
+		return [][]byte{diff}
+	}
+	chunks := splitDiffFiles(diff)
+	if len(chunks) <= 1 {
+		return [][]byte{diff}
+	}
+	var groups [][]byte
+	var cur strings.Builder
+	curLines := 0
+	flush := func() {
+		if cur.Len() > 0 {
+			groups = append(groups, []byte(cur.String()))
+			cur.Reset()
+			curLines = 0
+		}
+	}
+	for _, ch := range chunks {
+		n := changedLines(ch)
+		if cur.Len() > 0 && curLines+n > maxLines {
+			flush()
+		}
+		cur.Write(ch)
+		curLines += n
+	}
+	flush()
+	return groups
+}
+
+// splitDiffFiles cuts a diff into per-file chunks on "diff --git" headers,
+// keeping each header with its chunk.
+func splitDiffFiles(diff []byte) [][]byte {
+	s := string(diff)
+	var starts []int
+	rest := s
+	offset := 0
+	for {
+		i := strings.Index(rest, "\ndiff --git ")
+		if i < 0 {
+			break
+		}
+		starts = append(starts, offset+i+1)
+		offset += i + 1
+		rest = s[offset:]
+	}
+	if len(starts) == 0 {
+		return [][]byte{diff}
+	}
+	var chunks [][]byte
+	prev := 0
+	for _, k := range starts {
+		chunks = append(chunks, []byte(s[prev:k]))
+		prev = k
+	}
+	chunks = append(chunks, []byte(s[prev:]))
+	return chunks
+}
+
+// changedLines counts added and removed lines in a diff chunk, excluding
+// the +++/--- file headers.
+func changedLines(chunk []byte) int {
+	n := 0
+	for _, line := range strings.Split(string(chunk), "\n") {
+		if (strings.HasPrefix(line, "+") && !strings.HasPrefix(line, "+++")) ||
+			(strings.HasPrefix(line, "-") && !strings.HasPrefix(line, "---")) {
+			n++
+		}
+	}
+	return n
+}
+
+// hasGoFiles reports whether a diff chunk touches Go source files.
+func hasGoFiles(chunk []byte) bool {
+	for _, line := range strings.Split(string(chunk), "\n") {
+		if strings.HasPrefix(line, "+++ b/") && strings.HasSuffix(strings.TrimSpace(line), ".go") {
+			return true
+		}
+	}
+	return false
+}
+
+// severityRank orders findings high → medium → low; advisory findings
+// (empty severity) rank last — without the "" entry Go's zero value would
+// tie them with high.
+var severityRank = map[string]int{"high": 0, "medium": 1, "low": 2, "": 3}
+
+// sortFindings orders findings high → medium → low → advisory, keeping the
+// order within one severity stable.
+func sortFindings(findings []Finding) {
+	sort.SliceStable(findings, func(i, j int) bool {
+		return severityRank[findings[i].Severity] < severityRank[findings[j].Severity]
+	})
+}
+
+// line renders a finding in its canonical "[sev] location - message" form,
+// used as the merge/dedup key across retry rounds.
+func (f Finding) line() string {
+	switch {
+	case f.Severity == "":
+		return "[?] " + f.Message
+	case f.Location != "":
+		return fmt.Sprintf("[%s] %s - %s", f.Severity, f.Location, f.Message)
+	default:
+		return fmt.Sprintf("[%s] %s", f.Severity, f.Message)
+	}
+}
+
+// mergeFindings appends findings that are not already present (exact line
+// match), preserving order.
+func mergeFindings(existing, added []Finding) []Finding {
+	seen := make(map[string]bool, len(existing))
+	for _, f := range existing {
+		seen[f.line()] = true
+	}
+	for _, f := range added {
+		if !seen[f.line()] {
+			seen[f.line()] = true
+			existing = append(existing, f)
+		}
+	}
+	return existing
+}
+
+// parseReview splits a model reply into findings and unparsable lines.
+func parseReview(raw string) (findings []Finding, bad []string) {
+	s := cleanMessage(raw)
+	if s == "" || strings.EqualFold(s, "OK") || strings.Contains(s, "无问题") && !strings.Contains(s, "[") {
+		return nil, nil
+	}
+	for _, line := range strings.Split(s, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		if m := reviewFinding.FindStringSubmatch(line); m != nil {
+			findings = append(findings, Finding{
+				Severity: m[1],
+				Location: m[2],
+				Message:  strings.TrimSpace(m[3]),
+			})
+		} else {
+			bad = append(bad, line)
+		}
+	}
+	return findings, bad
 }
 
 // truncateUTF8 cuts s to at most n bytes without splitting a multi-byte rune.

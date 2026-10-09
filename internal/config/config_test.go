@@ -132,8 +132,8 @@ shortcut_key_code = 11
 func TestLoadFileRejectsBadValues(t *testing.T) {
 	cases := map[string]string{
 		"int not a number": "[commit]\nsubject_max = \"fifty\"\n",
-		"array not array": "[commit]\ntypes = \"feat\"\n",
-		"array item bare": "[commit]\ntypes = [feat]\n",
+		"array not array":  "[commit]\ntypes = \"feat\"\n",
+		"array item bare":  "[commit]\ntypes = [feat]\n",
 	}
 	for name, content := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -144,6 +144,51 @@ func TestLoadFileRejectsBadValues(t *testing.T) {
 				t.Errorf("expected error")
 			}
 		})
+	}
+}
+
+func TestLoadFileParsesReviewAndSourceTreeKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[review]
+strict = true
+notify_max_findings = 3
+report_path = "/tmp/stai-review.md"
+group_max_lines = 42
+rules = ["错误必须 logf", "禁止全局可变状态"]
+base_url = "http://example.test/v1"
+model = "review-model"
+temperature = 1.5
+
+[sourcetree]
+review_action_caption = "AI 审查"
+review_shortcut_key_code = 15
+review_shortcut_modifiers = 524288
+review_shortcut_display = "⌥R"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	if err := loadFile(&cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	if !cfg.Review.Strict || cfg.Review.NotifyMaxFindings != 3 || cfg.Review.ReportPath != "/tmp/stai-review.md" ||
+		cfg.Review.GroupMaxLines != 42 || len(cfg.Review.Rules) != 2 || cfg.Review.Rules[0] != "错误必须 logf" ||
+		cfg.Review.BaseURL != "http://example.test/v1" || cfg.Review.APIKey != "" || cfg.Review.Model != "review-model" {
+		t.Errorf("review not parsed: %+v", cfg.Review)
+	}
+	if cfg.Review.Temperature == nil || *cfg.Review.Temperature != 1.5 {
+		t.Errorf("review.temperature not parsed: %+v", cfg.Review.Temperature)
+	}
+	if cfg.Provider.Temperature != 0 {
+		t.Errorf("provider.temperature default = %v, want 0", cfg.Provider.Temperature)
+	}
+	if cfg.SourceTree.ReviewActionCaption != "AI 审查" || cfg.SourceTree.ReviewShortcutKeyCode != 15 ||
+		cfg.SourceTree.ReviewShortcutModifiers != 524288 || cfg.SourceTree.ReviewShortcutDisplay != "⌥R" {
+		t.Errorf("sourcetree review keys not parsed: %+v", cfg.SourceTree)
 	}
 }
 

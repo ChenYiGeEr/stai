@@ -8,6 +8,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
@@ -40,6 +41,8 @@ func main() {
 		cmdMergetool(args)
 	case "install":
 		cmdInstall(args)
+	case "uninstall":
+		cmdUninstall(args)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -60,10 +63,15 @@ Commands:
              to the clipboard (M1)
   hook       Entrypoint for git hooks:
              stai hook prepare-commit-msg <msg-file> [source]
-  review     AI review of the staged changes (M2, advisory by default)
+             stai hook pre-commit
+  review     AI review of the staged changes (M2). Advisory by default;
+             -strict exits non-zero on high-severity findings.
+             Optional positional argument: the repository path.
   mergetool  Resolve conflicts with per-hunk AI suggestions (M3)
-  install    Write the prepare-commit-msg hook and register the
-             SourceTree custom action (M1)
+  install    Write the prepare-commit-msg and pre-commit hooks and
+             register the SourceTree custom actions (M1+M2)
+  uninstall  Remove everything install wrote (stai-owned hooks and
+             custom actions only)
 
 Config: ~/.config/stai/config.toml + per-repo .stai.toml
 Env overrides: STAI_BASE_URL, STAI_API_KEY, STAI_MODEL
@@ -131,6 +139,7 @@ func cmdGen(args []string) {
 func generate(ctx context.Context, cfg config.Config, diff []byte) (string, error) {
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
 		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	client.Temperature = cfg.Provider.Temperature
 	return client.GenerateCommit(ctx, cfg.Commit, diff)
 }
 
@@ -141,7 +150,7 @@ func dialogEdit(msg string) (edited string, ok bool) {
 	script := `on run argv
 	return text returned of (display dialog "可编辑,确定后复制到剪贴板,再到 SourceTree 提交框粘贴" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
 end run`
-	cmd := exec.Command("osascript", "-e", script, "--", msg)
+	cmd := utf8Cmd("osascript", "-e", script, "--", msg)
 	out, err := cmd.Output()
 	if err != nil {
 		return "", false // -128 = user cancelled
@@ -149,29 +158,40 @@ end run`
 	return strings.TrimRight(string(out), "\n"), true
 }
 
-// cmdHook implements "stai hook prepare-commit-msg": fill in a generated
-// message only when the user left the commit message empty. It must never
-// block a commit, so every failure path exits 0.
+// cmdHook is the entrypoint git hooks call. prepare-commit-msg fills in a
+// generated message when the commit box is left empty (never blocks); the
+// strict-mode pre-commit gate blocks only on high-severity findings when
+// review.strict is enabled.
 func cmdHook(args []string) {
 	fs := flag.NewFlagSet("hook", flag.ExitOnError)
 	fs.Parse(args)
-	if len(fs.Args()) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai hook <prepare-commit-msg> <msg-file> [source]")
+	if fs.NArg() < 1 {
+		fmt.Fprintln(os.Stderr, "usage: stai hook <prepare-commit-msg <msg-file> [source] | pre-commit>")
 		os.Exit(2)
 	}
-	if fs.Arg(0) != "prepare-commit-msg" {
+	switch fs.Arg(0) {
+	case "prepare-commit-msg":
+		hookPrepareCommitMsg(fs.Arg(1), fs.Arg(2))
+	case "pre-commit":
+		hookPreCommit()
+	default:
 		fmt.Fprintf(os.Stderr, "unknown hook: %s\n", fs.Arg(0))
 		os.Exit(2)
 	}
+}
 
-	msgFile := fs.Arg(1)
-	source := fs.Arg(2)
-
+// hookPrepareCommitMsg fills in a generated message only when the user left
+// the commit message empty. It must never block a commit, so every failure
+// path exits 0.
+func hookPrepareCommitMsg(msgFile, source string) {
 	if os.Getenv("STAI_DISABLE") != "" {
 		return
 	}
 	// Merge and squash commits carry their own messages; never touch those.
 	if source == "merge" || source == "squash" || source == "commit" {
+		return
+	}
+	if msgFile == "" {
 		return
 	}
 	data, err := os.ReadFile(msgFile)
@@ -184,8 +204,12 @@ func cmdHook(args []string) {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	logPath = cfg.Log.Path
+	logf("hook prepare-commit-msg start (message empty)")
+
 	diff, err := git.StagedDiff()
 	if err != nil {
+		logf("hook prepare-commit-msg: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
@@ -194,19 +218,68 @@ func cmdHook(args []string) {
 	defer cancel()
 	msg, err := generate(ctx, cfg, diff)
 	if err != nil {
+		logf("hook prepare-commit-msg: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: commit message generation failed, committing as-is: %v\n", err)
 		return
 	}
+	logf("hook prepare-commit-msg message=%q", msg)
 	if err := os.WriteFile(msgFile, []byte(msg+"\n"), 0o644); err != nil {
+		logf("hook prepare-commit-msg: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 	}
 }
 
-// cmdInstall writes the prepare-commit-msg hook into the current repository
-// and registers the "AI 生成提交信息" custom action in SourceTree.
+// hookPreCommit implements the strict-mode pre-commit gate (M2). It only
+// acts when review.strict is enabled: the staged diff is reviewed and the
+// commit is blocked (exit 1) when a high-severity finding is present, with
+// the report on stderr (git/SourceTree show it on the failed commit).
+// Everything else passes: no review without strict, and AI or parse
+// failures never block a commit.
+func hookPreCommit() {
+	if os.Getenv("STAI_DISABLE") != "" {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		return
+	}
+	logPath = cfg.Log.Path
+	logf("hook pre-commit start strict=%v", cfg.Review.Strict)
+	if !cfg.Review.Strict {
+		return // advisory review happens on demand via "stai review"
+	}
+
+	diff, err := git.StagedDiff()
+	if err != nil {
+		logf("hook pre-commit: %v (passing)", err)
+		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	defer cancel()
+	findings, err := generateReview(ctx, cfg, diff)
+	if err != nil {
+		logf("hook pre-commit: %v (passing)", err)
+		fmt.Fprintf(os.Stderr, "stai: review failed, committing as-is: %v\n", err)
+		return
+	}
+	logf("hook pre-commit done findings=%d high=%v", len(findings), ai.HasHigh(findings))
+	if ai.HasHigh(findings) {
+		fmt.Fprintln(os.Stderr, "stai: pre-commit 审查发现高危问题,提交已阻断(绕过:STAI_DISABLE=1 或 git commit --no-verify):")
+		fmt.Fprint(os.Stderr, renderFindings(findings))
+		os.Exit(1)
+	}
+}
+
+// cmdInstall writes the prepare-commit-msg and pre-commit hooks into the
+// current repository and registers the "AI 生成提交信息" and "AI 审查改动"
+// custom actions in SourceTree. Idempotent: stai-owned hooks and actions are
+// replaced, everything else is left alone.
 func cmdInstall(args []string) {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
-	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom action")
+	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom actions")
 	fs.Parse(args)
 
 	cfg, err := config.Load()
@@ -216,48 +289,141 @@ func cmdInstall(args []string) {
 	exe, err = filepathEvalSymlinks(exe)
 	fatal(err)
 
-	hookPath, err := git.HookPath("prepare-commit-msg")
-	fatal(err)
-	hookScript := fmt.Sprintf(`#!/bin/sh
+	hooks := []struct{ name, body string }{
+		{
+			"prepare-commit-msg",
+			fmt.Sprintf(`#!/bin/sh
 # installed by stai — fills in an AI-generated message when the commit
 # message is left empty. Never blocks a commit.
 "%s" hook prepare-commit-msg "$@" || exit 0
-`, exe)
-	if err := os.WriteFile(hookPath, []byte(hookScript), 0o755); err != nil {
-		fatal(fmt.Errorf("writing hook: %w", err))
+`, exe),
+		},
+		{
+			"pre-commit",
+			fmt.Sprintf(`#!/bin/sh
+# installed by stai — strict-mode pre-commit review (see review.strict).
+# Blocks only when stai itself reports high-severity findings (exit 1);
+# passes on every other outcome.
+"%s" hook pre-commit
+status=$?
+[ "$status" -eq 1 ] && exit 1
+exit 0
+`, exe),
+		},
 	}
-	fmt.Printf("hook installed: %s\n", hookPath)
+	for _, h := range hooks {
+		path, err := git.HookPath(h.name)
+		fatal(err)
+		if err := os.WriteFile(path, []byte(h.body), 0o755); err != nil {
+			fatal(fmt.Errorf("writing hook: %w", err))
+		}
+		fmt.Printf("hook installed: %s\n", path)
+	}
 
 	if *noSourceTree {
 		return
 	}
-	if err := installSourceTreeAction(exe, cfg.SourceTree); err != nil {
-		fmt.Fprintf(os.Stderr, `SourceTree custom action not registered: %v
+	if err := installSourceTreeActions(exe, cfg.SourceTree); err != nil {
+		fmt.Fprintf(os.Stderr, `SourceTree custom actions not registered: %v
 
-Add it manually: SourceTree → Settings → Custom Actions → Add:
+Add them manually: SourceTree → Settings → Custom Actions → Add:
   Menu caption:  %s
   Script to run: %s
   Parameters:    gen $REPO
-Then run "stai gen" in the repo (it copies the message to the clipboard).
-`, err, cfg.SourceTree.ActionCaption, exe)
+  Menu caption:  %s
+  Script to run: %s
+  Parameters:    review $REPO
+`, err, cfg.SourceTree.ActionCaption, exe, cfg.SourceTree.ReviewActionCaption, exe)
 		return
 	}
-	fmt.Printf("SourceTree custom action registered: %s (restart SourceTree)\n", cfg.SourceTree.ActionCaption)
+	fmt.Printf("SourceTree custom actions registered: %s, %s (restart SourceTree)\n",
+		cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption)
 }
 
-// installSourceTreeAction registers the custom action in SourceTree's real
+// cmdUninstall removes everything install wrote: hooks that carry the
+// "installed by stai" marker (user-written hooks of the same name are left
+// alone) and the stai custom actions in SourceTree (other tools' entries are
+// preserved). Idempotent: absent targets are fine.
+func cmdUninstall(args []string) {
+	fs := flag.NewFlagSet("uninstall", flag.ExitOnError)
+	noSourceTree := fs.Bool("no-sourcetree", false, "skip removing the SourceTree custom actions")
+	fs.Parse(args)
+
+	cfg, err := config.Load()
+	fatal(err)
+	exe, err := os.Executable()
+	fatal(err)
+	exe, err = filepathEvalSymlinks(exe)
+	fatal(err)
+
+	for _, name := range []string{"prepare-commit-msg", "pre-commit"} {
+		path, err := git.HookPath(name)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+			continue
+		}
+		data, err := os.ReadFile(path)
+		if os.IsNotExist(err) {
+			continue
+		}
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+			continue
+		}
+		if !strings.Contains(string(data), "installed by stai") {
+			fmt.Printf("hook left alone (not written by stai): %s\n", path)
+			continue
+		}
+		if err := os.Remove(path); err != nil {
+			fmt.Fprintf(os.Stderr, "stai: removing hook: %v\n", err)
+			continue
+		}
+		fmt.Printf("hook removed: %s\n", path)
+	}
+
+	if *noSourceTree {
+		return
+	}
+	removed, err := uninstallSourceTreeActions(exe, cfg.SourceTree)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, `SourceTree custom actions not removed: %v
+
+Remove them manually: SourceTree → Settings → Custom Actions:
+  %s
+  %s
+`, err, cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption)
+		return
+	}
+	fmt.Printf("SourceTree custom actions removed: %d (restart SourceTree)\n", removed)
+}
+
+// staiAction is one SourceTree custom action entry to register.
+type staiAction struct {
+	Caption   string `json:"caption"`
+	Params    string `json:"params"`
+	KeyCode   int    `json:"keyCode"`
+	Modifiers int    `json:"modifiers"`
+	Display   string `json:"display"`
+}
+
+// installSourceTreeActions registers the custom actions in SourceTree's real
 // action storage: ~/Library/Application Support/SourceTree/actions.plist,
-// an NSKeyedArchiver plist of mutable dictionaries. The schema below was
+// an NSKeyedArchiver plist of mutable dictionaries. The schema was
 // captured from a Sourcetree 4.2.19-generated entry (verified at runtime:
 // adding an action in the UI rewrites exactly this file). The defaults
 // "customActions" key is a legacy migration path and no longer feeds the
-// UI, which is why the original defaults-based install never showed up.
-// Read-modify-write runs in one JXA script so a crash midway cannot corrupt
-// the file; entries owned by other tools are preserved.
-func installSourceTreeAction(exe string, st config.SourceTree) error {
-	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", actionPlistJXA,
-		"--", exe, st.ActionCaption, "gen $REPO",
-		strconv.Itoa(st.ShortcutKeyCode), strconv.Itoa(st.ShortcutModifiers), st.ShortcutDisplay)
+// UI. Read-modify-write runs in one JXA script so a crash midway cannot
+// corrupt the file; entries owned by other tools are preserved.
+func installSourceTreeActions(exe string, st config.SourceTree) error {
+	data, err := json.Marshal([]staiAction{
+		{st.ReviewActionCaption, "review $REPO", st.ReviewShortcutKeyCode, st.ReviewShortcutModifiers, st.ReviewShortcutDisplay},
+		{st.ActionCaption, "gen $REPO", st.ShortcutKeyCode, st.ShortcutModifiers, st.ShortcutDisplay},
+	})
+	if err != nil {
+		return err
+	}
+	cmd := utf8Cmd("osascript", "-l", "JavaScript", "-e", actionsPlistJXA,
+		"--", exe, string(data))
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("updating actions.plist: %v: %s", err, strings.TrimSpace(string(out)))
@@ -265,24 +431,52 @@ func installSourceTreeAction(exe string, st config.SourceTree) error {
 	return nil
 }
 
-// actionPlistJXA deduplicates and appends the stai entry in actions.plist.
-// argv: exe path, menu caption, parameters ($REPO is expanded by SourceTree
-// to the repository path at run time), shortcut key code, shortcut
-// modifiers, shortcut display text. The action runs "gen" directly — no
-// dialog — because review and edits happen in the commit box itself.
-const actionPlistJXA = `function run(argv) {
+// uninstallSourceTreeActions removes the stai entries (matching the exe path
+// or the configured captions) from actions.plist and returns how many were
+// removed. Other tools' entries are preserved.
+func uninstallSourceTreeActions(exe string, st config.SourceTree) (int, error) {
+	captions, err := json.Marshal([]string{st.ActionCaption, st.ReviewActionCaption})
+	if err != nil {
+		return 0, err
+	}
+	cmd := utf8Cmd("osascript", "-l", "JavaScript", "-e", removeActionsPlistJXA,
+		"--", exe, string(captions))
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return 0, fmt.Errorf("updating actions.plist: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	n, err := strconv.Atoi(strings.TrimSpace(string(out)))
+	if err != nil {
+		return 0, fmt.Errorf("unexpected JXA output: %q", string(out))
+	}
+	return n, nil
+}
+
+// actionsPlistJXA deduplicates and appends the stai entries in actions.plist.
+// argv: exe path, JSON array of actions (caption, params — $REPO is expanded
+// by SourceTree to the repository path at run time — keyCode, modifiers,
+// display text). The actions run directly — no dialog — because review and
+// edits happen in SourceTree itself.
+const actionsPlistJXA = `function run(argv) {
 	ObjC.import('Foundation');
-	var exe = argv[0], caption = argv[1], params = argv[2];
-	var keyCode = parseInt(argv[3], 10), modifiers = parseInt(argv[4], 10), display = argv[5];
+	var exe = argv[0];
+	var actions = JSON.parse(argv[1]);
 	var path = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Application Support/SourceTree/actions.plist');
 	var list = $.NSMutableArray.alloc.init;
 	var fm = $.NSFileManager.defaultManager;
 	if (fm.fileExistsAtPath(path)) {
 		var data = $.NSData.dataWithContentsOfFile(path);
 		if (data && data.length > 0) {
-			var obj = $.NSKeyedUnarchiver.unarchiveObjectWithData(data);
-			if (obj && obj.isKindOfClass($.NSArray.class)) {
+			var obj = null;
+			try {
+				obj = $.NSKeyedUnarchiver.unarchiveObjectWithData(data);
+				// A file that exists but does not unarchive to an action
+				// list is corrupt or foreign: abort rather than overwrite
+				// other tools' entries with an empty list.
+				if (!(obj && obj.isKindOfClass && obj.isKindOfClass($.NSArray.class))) throw 'unreadable';
 				list = $.NSMutableArray.arrayWithArray(obj);
+			} catch (e) {
+				throw Error('actions.plist exists but is not a readable action list — leaving it untouched: ' + path);
 			}
 		}
 	}
@@ -292,25 +486,82 @@ const actionPlistJXA = `function run(argv) {
 		var t = d.objectForKey('target');
 		var n = d.objectForKey('name');
 		if (t && t.isEqualToString(exe)) continue;
-		if (n && n.isEqualToString(caption)) continue;
+		var drop = false;
+		if (n) {
+			for (var j = 0; j < actions.length; j++) {
+				if (n.isEqualToString(actions[j].caption)) { drop = true; break; }
+			}
+		}
+		if (drop) continue;
 		kept.addObject(d);
 	}
-	var e = $.NSMutableDictionary.alloc.init;
-	e.setObjectForKey(caption, 'name');
-	e.setObjectForKey(exe, 'target');
-	e.setObjectForKey(params, 'params');
-	e.setObjectForKey($.NSNumber.numberWithBool(false), 'fileAction');
-	e.setObjectForKey($.NSNumber.numberWithBool(false), 'logAction');
-	e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
-	e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
-	e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
-	e.setObjectForKey($.NSNumber.numberWithInt(keyCode), 'shortcutKeyCode');
-	e.setObjectForKey($.NSNumber.numberWithInt(modifiers), 'shortcutKeyModifiers');
-	e.setObjectForKey(display, 'shortcutKeyDisplay');
-	kept.addObject(e);
+	for (var i = 0; i < actions.length; i++) {
+		var a = actions[i];
+		var e = $.NSMutableDictionary.alloc.init;
+		e.setObjectForKey(a.caption, 'name');
+		e.setObjectForKey(exe, 'target');
+		e.setObjectForKey(a.params, 'params');
+		e.setObjectForKey($.NSNumber.numberWithBool(false), 'fileAction');
+		e.setObjectForKey($.NSNumber.numberWithBool(false), 'logAction');
+		e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
+		e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
+		e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
+		e.setObjectForKey($.NSNumber.numberWithInt(a.keyCode), 'shortcutKeyCode');
+		e.setObjectForKey($.NSNumber.numberWithInt(a.modifiers), 'shortcutKeyModifiers');
+		e.setObjectForKey(a.display, 'shortcutKeyDisplay');
+		kept.addObject(e);
+	}
 	var out = $.NSKeyedArchiver.archivedDataWithRootObject(kept);
 	if (!out.writeToFileAtomically(path, true)) throw Error('write failed: ' + path);
 	return 'actions.plist now has ' + kept.count + ' entries';
+}`
+
+// removeActionsPlistJXA drops the stai entries from actions.plist and prints
+// the removed count. argv: exe path, JSON array of captions.
+const removeActionsPlistJXA = `function run(argv) {
+	ObjC.import('Foundation');
+	var exe = argv[0];
+	var captions = JSON.parse(argv[1]);
+	var path = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Application Support/SourceTree/actions.plist');
+	var list = $.NSMutableArray.alloc.init;
+	var fm = $.NSFileManager.defaultManager;
+	if (fm.fileExistsAtPath(path)) {
+		var data = $.NSData.dataWithContentsOfFile(path);
+		if (data && data.length > 0) {
+			var obj = null;
+			try {
+				obj = $.NSKeyedUnarchiver.unarchiveObjectWithData(data);
+				// A file that exists but does not unarchive to an action
+				// list is corrupt or foreign: abort rather than overwrite
+				// other tools' entries with an empty list.
+				if (!(obj && obj.isKindOfClass && obj.isKindOfClass($.NSArray.class))) throw 'unreadable';
+				list = $.NSMutableArray.arrayWithArray(obj);
+			} catch (e) {
+				throw Error('actions.plist exists but is not a readable action list — leaving it untouched: ' + path);
+			}
+		}
+	}
+	var kept = $.NSMutableArray.alloc.init;
+	var removed = 0;
+	for (var i = 0; i < list.count; i++) {
+		var d = list.objectAtIndex(i);
+		var t = d.objectForKey('target');
+		var n = d.objectForKey('name');
+		var drop = (t && t.isEqualToString(exe));
+		if (!drop && n) {
+			for (var j = 0; j < captions.length; j++) {
+				if (n.isEqualToString(captions[j])) { drop = true; break; }
+			}
+		}
+		if (drop) { removed++; continue; }
+		kept.addObject(d);
+	}
+	// Nothing to remove from a machine that has no actions.plist: do not
+	// create the file by writing an empty list back.
+	if (!fm.fileExistsAtPath(path)) return '0';
+	var out = $.NSKeyedArchiver.archivedDataWithRootObject(kept);
+	if (!out.writeToFileAtomically(path, true)) throw Error('write failed: ' + path);
+	return '' + removed;
 }`
 
 // writeClipboard puts msg on the pasteboard and verifies it by reading it
@@ -357,16 +608,21 @@ const pasteboardWriteJXA = `function run(argv) {
 	return 'ok';
 }`
 
-// notifyCopied surfaces the generated message in a macOS notification —
-// SourceTree custom actions swallow stdout, so without it the user would
-// see nothing before pasting. Best-effort: a notification failure must
-// never break an otherwise successful copy.
-func notifyCopied(n config.Notify, msg string) {
+// notify shows a macOS notification. Best-effort: a failure must never
+// break the workflow.
+func notify(title, subtitle, body string) {
 	script := `on run argv
 	display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
 end run`
-	cmd := utf8Cmd("osascript", "-e", script, "--", msg, n.Title, n.Subtitle)
+	cmd := utf8Cmd("osascript", "-e", script, "--", body, title, subtitle)
 	_ = cmd.Run()
+}
+
+// notifyCopied surfaces the generated message in a macOS notification —
+// SourceTree custom actions swallow stdout, so without it the user would
+// see nothing before pasting.
+func notifyCopied(n config.Notify, msg string) {
+	notify(n.Title, n.Subtitle, msg)
 }
 
 func filepathEvalSymlinks(p string) (string, error) {
@@ -376,11 +632,160 @@ func filepathEvalSymlinks(p string) (string, error) {
 	return p, nil
 }
 
+// cmdReview implements "stai review": AI review of the staged diff (M2).
+// Advisory by default; -strict (or review.strict in the config) makes it
+// exit non-zero when a high-severity finding is present. The report goes to
+// stdout; when triggered from SourceTree (stdout discarded) a notification
+// carries either the full report (few findings) or a summary plus the
+// report-file path.
 func cmdReview(args []string) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
-	_ = fs.Bool("strict", false, "exit non-zero on high-severity findings (pre-commit mode)")
+	strictFlag := fs.Bool("strict", false, "exit non-zero on high-severity findings (pre-commit mode)")
 	fs.Parse(args)
-	notImplemented("review", "M2: AI review of staged diff, advisory output by default")
+
+	cfg, err := config.Load()
+	fatal(err)
+	logPath = cfg.Log.Path
+
+	repoDir := ""
+	if fs.NArg() > 0 {
+		repoDir = fs.Arg(0)
+	}
+	if repoDir == "" {
+		repoDir, err = os.Getwd()
+		fatal(err)
+	}
+	reviewBaseURL, _, reviewModel, _ := reviewProvider(cfg)
+	logf("review start args=%q model=%s base_url=%s", args, reviewModel, reviewBaseURL)
+
+	diff, err := git.StagedDiffDir(repoDir)
+	fatal(err)
+
+	findings, err := generateReview(context.Background(), cfg, diff)
+	if err != nil {
+		logf("review error: %v", err)
+		fatal(err)
+	}
+	logf("review done findings=%d high=%v", len(findings), ai.HasHigh(findings))
+
+	report := renderFindings(findings)
+	fmt.Print(report)
+
+	// SourceTree discards stdout, so the report also goes to a
+	// notification: the full text when it fits, otherwise a summary plus
+	// the report-file path.
+	notifBody := report
+	subtitle := "审查完成"
+	if len(findings) > cfg.Review.NotifyMaxFindings {
+		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
+			notifBody = fmt.Sprintf("问题较多,完整报告已写入 %s\n\n%s", path, severitySummary(findings))
+			subtitle = "审查完成,报告已写入文件"
+		} else {
+			logf("review report file write failed: %v", werr)
+			notifBody = severitySummary(findings)
+		}
+	}
+	notify(cfg.Notify.Title, subtitle, notifBody)
+
+	if (*strictFlag || cfg.Review.Strict) && ai.HasHigh(findings) {
+		logf("review blocked commit (strict, high severity)")
+		os.Exit(1)
+	}
+}
+
+// reviewProvider resolves the effective endpoint for review: the review.*
+// config overrides win over the global [provider], so review can use a
+// stronger model while gen stays on a fast one.
+func reviewProvider(cfg config.Config) (baseURL, apiKey, model string, temperature float64) {
+	baseURL, apiKey, model = cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model
+	temperature = cfg.Provider.Temperature
+	if cfg.Review.BaseURL != "" {
+		baseURL = cfg.Review.BaseURL
+	}
+	if cfg.Review.APIKey != "" {
+		apiKey = cfg.Review.APIKey
+	}
+	if cfg.Review.Model != "" {
+		model = cfg.Review.Model
+	}
+	if cfg.Review.Temperature != nil {
+		temperature = *cfg.Review.Temperature
+	}
+	return baseURL, apiKey, model, temperature
+}
+
+// generateReview asks the configured model to review diff. Both the review
+// command and the pre-commit hook use it so provider wiring lives in one place.
+func generateReview(ctx context.Context, cfg config.Config, diff []byte) ([]ai.Finding, error) {
+	baseURL, apiKey, model, temperature := reviewProvider(cfg)
+	client := ai.NewClient(baseURL, apiKey, model,
+		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	client.Temperature = temperature
+	return client.GenerateReview(ctx, ai.ReviewParams{
+		Diff:          diff,
+		MaxChars:      cfg.Commit.MaxDiffChars,
+		Retries:       cfg.Commit.Retries,
+		GroupMaxLines: cfg.Review.GroupMaxLines,
+		Rules:         cfg.Review.Rules,
+	})
+}
+
+// renderFindings formats findings as a readable report; empty means OK.
+func renderFindings(findings []ai.Finding) string {
+	if len(findings) == 0 {
+		return "OK 未发现问题\n"
+	}
+	var b strings.Builder
+	for _, f := range findings {
+		if f.Severity == "" {
+			fmt.Fprintf(&b, "[?] %s\n", f.Message)
+			continue
+		}
+		if f.Location != "" {
+			fmt.Fprintf(&b, "[%s] %s - %s\n", f.Severity, f.Location, f.Message)
+		} else {
+			fmt.Fprintf(&b, "[%s] %s\n", f.Severity, f.Message)
+		}
+	}
+	return b.String()
+}
+
+// severitySummary counts findings per severity level.
+func severitySummary(findings []ai.Finding) string {
+	var high, medium, low, other int
+	for _, f := range findings {
+		switch f.Severity {
+		case "high":
+			high++
+		case "medium":
+			medium++
+		case "low":
+			low++
+		default:
+			other++
+		}
+	}
+	return fmt.Sprintf("high %d,medium %d,low %d,未归类 %d", high, medium, low, other)
+}
+
+// writeReportFile saves the full report under the repo (default
+// .git/stai-review.md, configurable via review.report_path) and returns the
+// written path.
+func writeReportFile(cfg config.Config, repoDir string, findings []ai.Finding) (string, error) {
+	path := cfg.Review.ReportPath
+	if !filepath.IsAbs(path) {
+		path = filepath.Join(repoDir, path)
+	}
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", err
+	}
+	content := fmt.Sprintf("# stai 审查报告\n\n%s\n%s\n",
+		time.Now().Format("2006-01-02 15:04:05"), renderFindings(findings))
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		return "", err
+	}
+	return path, nil
 }
 
 func cmdMergetool(args []string) {
@@ -454,4 +859,3 @@ func logClipboard(tag, want string) {
 	logf("gen clipboard %s match=%v changeCount=%s got=%q err=%v countErr=%v",
 		tag, got == want, count, got, err, cerr)
 }
-
