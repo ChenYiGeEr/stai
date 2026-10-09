@@ -12,6 +12,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -19,10 +20,6 @@ import (
 	"stai/internal/config"
 	"stai/internal/git"
 )
-
-// maxDiffChars caps the diff sent to the model. Beyond this we truncate and
-// tell the model, rather than failing the commit.
-const maxDiffChars = 60000
 
 func main() {
 	if len(os.Args) < 2 {
@@ -88,6 +85,8 @@ func cmdGen(args []string) {
 
 	cfg, err := config.Load()
 	fatal(err)
+	logPath = cfg.Log.Path
+	logf("gen start args=%q", args)
 
 	// SourceTree custom actions append $REPO (the repository path) to the
 	// parameters; the plain CLI passes nothing and uses the current dir.
@@ -102,14 +101,7 @@ func cmdGen(args []string) {
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
-	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model)
-	msg, err := client.GenerateCommit(context.Background(), ai.CommitParams{
-		Style:    cfg.Commit.Style,
-		Language: cfg.Commit.Language,
-		Diff:     diff,
-		MaxChars: maxDiffChars,
-		Retries:  1,
-	})
+	msg, err := generate(context.Background(), cfg, diff)
 	fatal(err)
 
 	if *editFlag {
@@ -121,13 +113,24 @@ func cmdGen(args []string) {
 	}
 	// The clipboard is the delivery channel; the notification is the only
 	// visible feedback because SourceTree custom actions discard stdout.
+	logf("gen repo=%s message=%q", repoDir, msg)
 	if err := copyToClipboard(msg); err != nil {
+		logf("gen clipboard copy failed: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
 		return
 	}
-	notifyCopied(msg)
+	logf("gen copied")
+	notifyCopied(cfg.Notify, msg)
 	fmt.Fprintln(os.Stderr, "copied to clipboard")
 	fmt.Println(msg)
+}
+
+// generate asks the configured model for a commit message for diff. Both
+// gen and the hook use it so the provider and rules are wired in one place.
+func generate(ctx context.Context, cfg config.Config, diff []byte) (string, error) {
+	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
+		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	return client.GenerateCommit(ctx, cfg.Commit, diff)
 }
 
 // dialogEdit shows the generated message in an editable macOS dialog. It
@@ -135,7 +138,7 @@ func cmdGen(args []string) {
 // fails (never block the workflow because of a UI hiccup).
 func dialogEdit(msg string) (edited string, ok bool) {
 	script := `on run argv
-	return text returned of (display dialog "可编辑,确定后填入 SourceTree 提交框(失败则复制到剪贴板)" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
+	return text returned of (display dialog "可编辑,确定后复制到剪贴板,再到 SourceTree 提交框粘贴" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
 end run`
 	cmd := exec.Command("osascript", "-e", script, "--", msg)
 	out, err := cmd.Output()
@@ -186,16 +189,9 @@ func cmdHook(args []string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
-	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model)
-	msg, err := client.GenerateCommit(ctx, ai.CommitParams{
-		Style:    cfg.Commit.Style,
-		Language: cfg.Commit.Language,
-		Diff:     diff,
-		MaxChars: maxDiffChars,
-		Retries:  1,
-	})
+	msg, err := generate(ctx, cfg, diff)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "stai: commit message generation failed, committing as-is: %v\n", err)
 		return
@@ -212,6 +208,8 @@ func cmdInstall(args []string) {
 	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom action")
 	fs.Parse(args)
 
+	cfg, err := config.Load()
+	fatal(err)
 	exe, err := os.Executable()
 	fatal(err)
 	exe, err = filepathEvalSymlinks(exe)
@@ -232,23 +230,19 @@ func cmdInstall(args []string) {
 	if *noSourceTree {
 		return
 	}
-	if err := installSourceTreeAction(exe); err != nil {
+	if err := installSourceTreeAction(exe, cfg.SourceTree); err != nil {
 		fmt.Fprintf(os.Stderr, `SourceTree custom action not registered: %v
 
 Add it manually: SourceTree → Settings → Custom Actions → Add:
-  Menu caption:  AI 生成提交信息
+  Menu caption:  %s
   Script to run: %s
   Parameters:    gen $REPO
-Then run "stai gen" in the repo (it fills the message into the commit box,
-falling back to the clipboard).
-`, err, exe)
+Then run "stai gen" in the repo (it copies the message to the clipboard).
+`, err, cfg.SourceTree.ActionCaption, exe)
 		return
 	}
-	fmt.Println("SourceTree custom action registered: AI 生成提交信息 (restart SourceTree)")
+	fmt.Printf("SourceTree custom action registered: %s (restart SourceTree)\n", cfg.SourceTree.ActionCaption)
 }
-
-// actionCaption is the menu caption of the SourceTree custom action.
-const actionCaption = "AI 生成提交信息"
 
 // installSourceTreeAction registers the custom action in SourceTree's real
 // action storage: ~/Library/Application Support/SourceTree/actions.plist,
@@ -259,9 +253,10 @@ const actionCaption = "AI 生成提交信息"
 // UI, which is why the original defaults-based install never showed up.
 // Read-modify-write runs in one JXA script so a crash midway cannot corrupt
 // the file; entries owned by other tools are preserved.
-func installSourceTreeAction(exe string) error {
+func installSourceTreeAction(exe string, st config.SourceTree) error {
 	cmd := exec.Command("osascript", "-l", "JavaScript", "-e", actionPlistJXA,
-		"--", exe, actionCaption, "gen $REPO")
+		"--", exe, st.ActionCaption, "gen $REPO",
+		strconv.Itoa(st.ShortcutKeyCode), strconv.Itoa(st.ShortcutModifiers), st.ShortcutDisplay)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("updating actions.plist: %v: %s", err, strings.TrimSpace(string(out)))
@@ -271,11 +266,13 @@ func installSourceTreeAction(exe string) error {
 
 // actionPlistJXA deduplicates and appends the stai entry in actions.plist.
 // argv: exe path, menu caption, parameters ($REPO is expanded by SourceTree
-// to the repository path at run time). The action runs "gen" directly — no
+// to the repository path at run time), shortcut key code, shortcut
+// modifiers, shortcut display text. The action runs "gen" directly — no
 // dialog — because review and edits happen in the commit box itself.
 const actionPlistJXA = `function run(argv) {
 	ObjC.import('Foundation');
 	var exe = argv[0], caption = argv[1], params = argv[2];
+	var keyCode = parseInt(argv[3], 10), modifiers = parseInt(argv[4], 10), display = argv[5];
 	var path = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Application Support/SourceTree/actions.plist');
 	var list = $.NSMutableArray.alloc.init;
 	var fm = $.NSFileManager.defaultManager;
@@ -306,9 +303,9 @@ const actionPlistJXA = `function run(argv) {
 	e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
 	e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
 	e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
-	e.setObjectForKey($.NSNumber.numberWithInt(5), 'shortcutKeyCode');       // kVK_ANSI_G
-	e.setObjectForKey($.NSNumber.numberWithInt(524288), 'shortcutKeyModifiers'); // NSEvent.ModifierFlags.option
-	e.setObjectForKey('⌥G', 'shortcutKeyDisplay');
+	e.setObjectForKey($.NSNumber.numberWithInt(keyCode), 'shortcutKeyCode');
+	e.setObjectForKey($.NSNumber.numberWithInt(modifiers), 'shortcutKeyModifiers');
+	e.setObjectForKey(display, 'shortcutKeyDisplay');
 	kept.addObject(e);
 	var out = $.NSKeyedArchiver.archivedDataWithRootObject(kept);
 	if (!out.writeToFileAtomically(path, true)) throw Error('write failed: ' + path);
@@ -325,11 +322,11 @@ func copyToClipboard(s string) error {
 // SourceTree custom actions swallow stdout, so without it the user would
 // see nothing before pasting. Best-effort: a notification failure must
 // never break an otherwise successful copy.
-func notifyCopied(msg string) {
+func notifyCopied(n config.Notify, msg string) {
 	script := `on run argv
-	display notification (item 1 of argv) with title "stai" subtitle "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框"
+	display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
 end run`
-	cmd := exec.Command("osascript", "-e", script, "--", msg)
+	cmd := exec.Command("osascript", "-e", script, "--", msg, n.Title, n.Subtitle)
 	_ = cmd.Run()
 }
 
@@ -360,7 +357,28 @@ func notImplemented(cmd, plan string) {
 
 func fatal(err error) {
 	if err != nil {
+		logf("error: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		os.Exit(1)
 	}
 }
+
+// logPath is the diagnostic log file: the default until the config is
+// loaded, then [log] path from the config.
+var logPath = config.Default().Log.Path
+
+// logf appends a timestamped line to the log file. SourceTree discards
+// custom-action output, so this is the only record of why a run failed.
+// Logging is best-effort and never affects the exit path.
+func logf(format string, args ...any) {
+	if logPath == "" {
+		return
+	}
+	f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	fmt.Fprintf(f, "%s %s\n", time.Now().Format("2006-01-02 15:04:05"), fmt.Sprintf(format, args...))
+}
+

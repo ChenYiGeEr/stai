@@ -5,54 +5,109 @@ package config
 
 import (
 	"bufio"
+	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
+
+	"stai/internal/git"
 )
 
 type Provider struct {
-	BaseURL string
-	APIKey  string
-	Model   string
+	BaseURL    string
+	APIKey     string
+	Model      string
+	TimeoutSec int // HTTP timeout for one chat completion request
 }
 
 type Commit struct {
-	Style    string // "conventional" or "free"
-	Language string // e.g. "zh-CN"
+	Style        string   // "conventional" or "free"
+	Language     string   // e.g. "zh-CN"
+	Types        []string // allowed Conventional Commits types
+	SubjectMax   int      // subject length hint (characters) given to the model
+	BodyMinLines int      // a body is requested only when changed lines exceed this
+	BodyMinFiles int      // ... or when touched files exceed this
+	BodyMaxItems int      // maximum bullet points in a body
+	MaxDiffChars int      // diff is truncated beyond this many bytes
+	Retries      int      // validation retries after a non-conforming reply
 }
 
 type Review struct {
 	Strict bool // true: pre-commit blocks on high-severity findings
 }
 
+type Hook struct {
+	TimeoutSec int // upper bound for the prepare-commit-msg hook
+}
+
+type Notify struct {
+	Title    string
+	Subtitle string
+}
+
+type SourceTree struct {
+	ActionCaption     string // menu caption of the custom action
+	ShortcutKeyCode   int    // kVK code of the shortcut key (5 = G)
+	ShortcutModifiers int    // NSEvent modifier flags (524288 = Option)
+	ShortcutDisplay   string // shortcut text shown in SourceTree
+}
+
+type Log struct {
+	Path string // diagnostic log file; "~/" is expanded
+}
+
 type Config struct {
-	Provider Provider
-	Commit   Commit
-	Review   Review
+	Provider   Provider
+	Commit     Commit
+	Review     Review
+	Hook       Hook
+	Notify     Notify
+	SourceTree SourceTree
+	Log        Log
 }
 
 func Default() Config {
+	home, _ := os.UserHomeDir()
 	return Config{
 		Provider: Provider{
-			BaseURL: "http://localhost:11434/v1", // local Ollama by default
-			APIKey:  "",
-			Model:   "qwen2.5-coder:7b",
+			BaseURL:    "http://localhost:11434/v1", // local Ollama by default
+			APIKey:     "",
+			Model:      "qwen2.5-coder:7b",
+			TimeoutSec: 120,
 		},
 		Commit: Commit{
-			Style:    "conventional",
-			Language: "zh-CN",
+			Style:        "conventional",
+			Language:     "zh-CN",
+			Types:        []string{"feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"},
+			SubjectMax:   50,
+			BodyMinLines: 100,
+			BodyMinFiles: 3,
+			BodyMaxItems: 5,
+			MaxDiffChars: 60000,
+			Retries:      1,
 		},
 		Review: Review{Strict: false},
+		Hook:   Hook{TimeoutSec: 120},
+		Notify: Notify{
+			Title:    "stai",
+			Subtitle: "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框",
+		},
+		SourceTree: SourceTree{
+			ActionCaption:     "AI 生成提交信息",
+			ShortcutKeyCode:   5,
+			ShortcutModifiers: 524288,
+			ShortcutDisplay:   "⌥G",
+		},
+		Log: Log{Path: filepath.Join(home, "Library", "Logs", "stai.log")},
 	}
 }
 
 // Load builds the effective configuration for the current repository.
+// Precedence (lowest to highest): defaults, global file, repo file, env.
 func Load() (Config, error) {
 	cfg := Default()
-	applyEnv(&cfg)
 
 	home, err := os.UserHomeDir()
 	if err == nil {
@@ -61,12 +116,32 @@ func Load() (Config, error) {
 		}
 	}
 
-	if root, err := repoRoot(); err == nil {
+	if root, err := git.RepoRoot(); err == nil {
 		if err := loadFile(&cfg, filepath.Join(root, ".stai.toml")); err != nil && !os.IsNotExist(err) {
 			return cfg, fmt.Errorf("repo config: %w", err)
 		}
 	}
+	applyEnv(&cfg)
+	if err := cfg.validate(); err != nil {
+		return cfg, err
+	}
 	return cfg, nil
+}
+
+func (cfg Config) validate() error {
+	if cfg.Commit.Style != "conventional" {
+		return fmt.Errorf("commit.style %q is not supported (only \"conventional\")", cfg.Commit.Style)
+	}
+	if len(cfg.Commit.Types) == 0 {
+		return errors.New("commit.types must not be empty")
+	}
+	if cfg.Provider.TimeoutSec <= 0 || cfg.Hook.TimeoutSec <= 0 {
+		return errors.New("timeout_seconds must be positive")
+	}
+	if cfg.Commit.Retries < 0 || cfg.Commit.MaxDiffChars < 0 {
+		return errors.New("commit.retries and commit.max_diff_chars must not be negative")
+	}
+	return nil
 }
 
 func applyEnv(cfg *Config) {
@@ -81,17 +156,10 @@ func applyEnv(cfg *Config) {
 	}
 }
 
-func repoRoot() (string, error) {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
-	if err != nil {
-		return "", err
-	}
-	return strings.TrimSpace(string(out)), nil
-}
-
 // loadFile parses a minimal TOML subset: [section] headers, scalar
-// key = value pairs (strings, booleans), # comments. That covers every
-// config stai defines without pulling in a TOML dependency.
+// key = value pairs (strings, integers, booleans), single-line arrays of
+// strings, # comments. That covers every config stai defines without
+// pulling in a TOML dependency.
 func loadFile(cfg *Config, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -145,44 +213,129 @@ func stripComment(s string) string {
 }
 
 func set(cfg *Config, section, key, raw string) error {
-	val, err := parseScalar(raw)
-	if err != nil {
-		return err
-	}
+	var err error
 	switch section + "." + key {
 	case "provider.base_url":
-		cfg.Provider.BaseURL = val
+		err = setString(raw, &cfg.Provider.BaseURL)
 	case "provider.api_key":
-		cfg.Provider.APIKey = val
+		err = setString(raw, &cfg.Provider.APIKey)
 	case "provider.model":
-		cfg.Provider.Model = val
+		err = setString(raw, &cfg.Provider.Model)
+	case "provider.timeout_seconds":
+		err = setInt(raw, &cfg.Provider.TimeoutSec)
 	case "commit.style":
-		cfg.Commit.Style = val
+		err = setString(raw, &cfg.Commit.Style)
 	case "commit.language":
-		cfg.Commit.Language = val
+		err = setString(raw, &cfg.Commit.Language)
+	case "commit.types":
+		err = setStrings(raw, &cfg.Commit.Types)
+	case "commit.subject_max":
+		err = setInt(raw, &cfg.Commit.SubjectMax)
+	case "commit.body_min_lines":
+		err = setInt(raw, &cfg.Commit.BodyMinLines)
+	case "commit.body_min_files":
+		err = setInt(raw, &cfg.Commit.BodyMinFiles)
+	case "commit.body_max_items":
+		err = setInt(raw, &cfg.Commit.BodyMaxItems)
+	case "commit.max_diff_chars":
+		err = setInt(raw, &cfg.Commit.MaxDiffChars)
+	case "commit.retries":
+		err = setInt(raw, &cfg.Commit.Retries)
 	case "review.strict":
-		b, err := strconv.ParseBool(val)
-		if err != nil {
-			return fmt.Errorf("review.strict: %w", err)
+		err = setBool(raw, &cfg.Review.Strict)
+	case "hook.timeout_seconds":
+		err = setInt(raw, &cfg.Hook.TimeoutSec)
+	case "notify.title":
+		err = setString(raw, &cfg.Notify.Title)
+	case "notify.subtitle":
+		err = setString(raw, &cfg.Notify.Subtitle)
+	case "sourcetree.action_caption":
+		err = setString(raw, &cfg.SourceTree.ActionCaption)
+	case "sourcetree.shortcut_key_code":
+		err = setInt(raw, &cfg.SourceTree.ShortcutKeyCode)
+	case "sourcetree.shortcut_modifiers":
+		err = setInt(raw, &cfg.SourceTree.ShortcutModifiers)
+	case "sourcetree.shortcut_display":
+		err = setString(raw, &cfg.SourceTree.ShortcutDisplay)
+	case "log.path":
+		var p string
+		if err = setString(raw, &p); err == nil {
+			cfg.Log.Path = expandHome(p)
 		}
-		cfg.Review.Strict = b
 	default:
 		return fmt.Errorf("unknown key %q in section [%s]", key, section)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
 	}
 	return nil
 }
 
-// parseScalar handles "double-quoted strings", 'single-quoted' and bare
-// booleans.
-func parseScalar(raw string) (string, error) {
+func setString(raw string, dst *string) error {
+	v, err := parseString(raw)
+	if err != nil {
+		return err
+	}
+	*dst = v
+	return nil
+}
+
+func setBool(raw string, dst *bool) error {
+	b, err := strconv.ParseBool(raw)
+	if err != nil {
+		return err
+	}
+	*dst = b
+	return nil
+}
+
+func setInt(raw string, dst *int) error {
+	n, err := strconv.Atoi(raw)
+	if err != nil {
+		return fmt.Errorf("expected an integer, got %q", raw)
+	}
+	*dst = n
+	return nil
+}
+
+// setStrings parses a single-line array such as ["feat", "fix"].
+func setStrings(raw string, dst *[]string) error {
+	if !strings.HasPrefix(raw, "[") || !strings.HasSuffix(raw, "]") {
+		return fmt.Errorf("expected an array like [\"a\", \"b\"], got %q", raw)
+	}
+	inner := strings.TrimSpace(raw[1 : len(raw)-1])
+	out := []string{}
+	if inner != "" {
+		for _, item := range strings.Split(inner, ",") {
+			v, err := parseString(strings.TrimSpace(item))
+			if err != nil {
+				return err
+			}
+			out = append(out, v)
+		}
+	}
+	*dst = out
+	return nil
+}
+
+// expandHome replaces a leading "~/" with the user's home directory.
+func expandHome(p string) string {
+	if !strings.HasPrefix(p, "~/") {
+		return p
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return p
+	}
+	return filepath.Join(home, p[2:])
+}
+
+// parseString handles "double-quoted strings" and 'single-quoted' strings.
+func parseString(raw string) (string, error) {
 	if len(raw) >= 2 {
 		if (raw[0] == '"' && raw[len(raw)-1] == '"') || (raw[0] == '\'' && raw[len(raw)-1] == '\'') {
 			return raw[1 : len(raw)-1], nil
 		}
 	}
-	switch raw {
-	case "true", "false":
-		return raw, nil
-	}
-	return "", fmt.Errorf("unsupported value %q (use a quoted string or boolean)", raw)
+	return "", fmt.Errorf("unsupported value %q (use a quoted string)", raw)
 }

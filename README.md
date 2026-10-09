@@ -1,136 +1,187 @@
 # stai — SourceTree 的 AI 伴侣工具
 
-stai 是一个外挂式的 Git 工作流 AI 助手：它不是 SourceTree 的插件（见下文「为什么不是插件」），
-而是一个独立的命令行工具，通过 Git 标准机制和 SourceTree 的自定义操作挂进你的工作流，
+stai 是一个独立的命令行工具，通过 Git 标准机制（钩子、自定义操作）接入 SourceTree 的工作流，
+不是 SourceTree 插件（SourceTree 没有插件机制，原因见 [docs/design.md](docs/design.md)）。
+
 提供三类能力：
 
-1. **commit 信息生成** —— 读暂存区 diff，按 Conventional Commits 生成提交信息；
-2. **提交前 code review** —— 对暂存区做 AI 审查，输出问题清单；
-3. **冲突合并协助** —— 接管 mergetool，逐冲突块给出解释与推荐解法。
+1. **commit 信息生成** —— 读暂存区 diff，按 Conventional Commits 生成提交信息（已可用）；
+2. **提交前 code review** —— 对暂存区做 AI 审查，输出问题清单（规划中，M2）；
+3. **冲突合并协助** —— 接管 mergetool，逐冲突块给出解释与推荐解法（规划中，M3）。
 
-## 为什么不是插件
+## 状态
 
-关键事实（已在安装于本机的 Sourcetree 4.2.19 上验证）：
+| 功能 | 命令 | 状态 |
+| --- | --- | --- |
+| commit 信息生成 | `stai gen`、`stai hook prepare-commit-msg`、`stai install` | ✅ 可用（M1） |
+| 提交前 review | `stai review` | 🚧 未实现（M2），目前仅打印提示 |
+| 冲突合并协助 | `stai mergetool` | 🚧 未实现（M3），目前仅打印提示 |
 
-- SourceTree **没有任何插件机制**——自带 framework 只有 Sparkle（自动更新）和
-  CocoaLumberjack（日志），二进制中没有插件加载点；
-- 它的可扩展面是 Git 本身外加三个官方口子：
-  1. **Git 钩子**（SourceTree 走系统 git，`prepare-commit-msg` / `pre-commit` 等均生效）；
-  2. **「动作 → 自定义操作」**（菜单注册外部命令，自动传入仓库路径、选中文件）；
-  3. **mergetool / difftool 包装**（可配置外部合并工具，附 Araxis 等包装脚本先例）；
-  4. `sourcetree://` URL scheme（备用通道）。
+配置项 `[review] strict` 目前不生效，待 M2 实现后启用。
 
-因此 stai 的定位是 **Git 侧伴侣**：所有功能都建立在 git 标准机制上，
-SourceTree 升级几乎不会影响我们；换用其他 Git GUI（Tower、Fork、命令行）同样可用。
+## 前置条件
 
-## 设计决策（已共识）
+- macOS（SourceTree 集成依赖 macOS 的 `osascript`、`pbcopy` 与 SourceTree 的 `actions.plist`）；
+- SourceTree（已在 4.2.19 上验证）；
+- Go 1.23+（仅从源码构建时需要）；
+- 一个 OpenAI 兼容的模型服务，默认为本机 Ollama（`http://localhost:11434/v1`），也可指向 LM Studio 或网关。
 
-| 决策点 | 结论 |
-| --- | --- |
-| 接入形态 | 外部伴侣工具：git 钩子 + SourceTree 自定义操作 + mergetool 包装 |
-| 交付顺序 | M1 commit 信息生成 → M2 提交前 review → M3 冲突合并协助 |
-| AI provider | OpenAI 兼容协议可配置，默认指向本机（Ollama / LM Studio），可改网关 |
-| 使用范围 | 先自用：CLI + 一键导入 SourceTree 自定义操作 |
-| 语言 | Go（单静态二进制，钩子冷启动毫秒级，团队分发只需拷贝一个文件） |
-| commit 信息交互 | 双通道：自定义操作「生成并复制」（系统通知展示全文，Cmd+V 粘贴）+ 空信息时钩子兜底 |
-| 冲突合并中 AI 角色 | 解说员 + 逐冲突建议，AI 不直接写文件（自动解决留作进阶开关） |
-| review 阻断策略 | 先建议后阻断：默认不拦截，严格模式（pre-commit 返回非零）用配置开关，默认关 |
-| 配置作用域 | 双层：全局 `~/.config/stai/config.toml` + 仓库级 `.stai.toml`（可提交，团队共享约定） |
+## 安装
 
-## 使用方式
-
-### 安装与注册
-
-在仓库根目录执行（全局安装后任意仓库都可运行）：
+在仓库根目录执行（全局安装后，任意仓库都可以运行）：
 
 ```bash
 stai install                  # 写 prepare-commit-msg 钩子 + 注册 SourceTree 自定义操作
 stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 ```
 
-`install` 做了两件事：
+`install` 做两件事：
 
-1. 向当前仓库写入 `prepare-commit-msg` 钩子（内容只有一行调用，指向 stai 二进制）；
-2. 向 SourceTree 的自定义操作存储写入条目：
-   `~/Library/Application Support/SourceTree/actions.plist`（NSKeyedArchiver
-   格式，schema 取自 4.2.19 实机生成的条目），菜单项 **AI 生成提交信息**，
-   参数 `gen $REPO`（SourceTree 会把 `$REPO` 展开为仓库路径传入），
-   快捷键 **⌥G**（安装后可在 SourceTree 设置 → 自定义操作中自行修改）。
+1. 向当前仓库写入 `prepare-commit-msg` 钩子（一段调用 stai 二进制的脚本）；
+2. 向 SourceTree 的自定义操作存储写入条目
+   `~/Library/Application Support/SourceTree/actions.plist`，菜单项为 **AI 生成提交信息**，
+   参数为 `gen $REPO`（SourceTree 会把 `$REPO` 展开为仓库路径），快捷键 **⌥G**
+   （可在 SourceTree 设置 → 自定义操作中修改）。
 
-该操作是幂等的：重复执行会替换指向本二进制或同名的旧条目，其他工具
-创建的条目原样保留。
-注意：**重装前先退出 SourceTree**——它在运行时会用内存中的动作列表
-覆盖 `actions.plist`，导致写入丢失。注册后需重启 SourceTree 菜单才会出现。
+该操作是幂等的：重复执行会替换指向本二进制或同名的旧条目，其他工具创建的条目原样保留。
 
-### 日常流程（M1：commit 信息生成）
+> **注意**：重装前先退出 SourceTree。它在运行时会用内存中的动作列表覆盖 `actions.plist`，
+> 导致写入丢失。注册后需重启 SourceTree 才会出现菜单项。
 
-两条通道互补，互不干扰：
+## 使用方式
 
-1. **自定义操作（推荐）**
-   SourceTree 里暂存改动 → 菜单栏「动作 → 自定义操作 → AI 生成提交信息」→
-   消息复制到剪贴板，并弹出系统通知展示生成全文（SourceTree 会吞掉自定义
-   操作的输出，不靠通知看不到消息）→ 光标点在提交框，Cmd+V 粘贴（粘贴即
-   「确定」）→ 在提交框中审阅、修改后提交。全程不碰窗口焦点，消息不会未经
-   确认就落框，也不会覆盖你已写的草稿。
-   等价命令行：`stai gen`；`stai gen --edit` 则先弹出可编辑对话框再复制。
+### 自定义操作（推荐）
 
-2. **钩子兜底（零操作）**
-   直接提交且提交框留空时，`prepare-commit-msg` 钩子会自动生成信息填进
-   提交框。merge / squash / commit（--amend）类提交和已有信息的提交一律
-   不碰；生成失败只打印警告，绝不阻断提交（内部 120 秒超时保护）。
+在 SourceTree 中暂存改动，然后执行 **动作 → 自定义操作 → AI 生成提交信息**（或按 ⌥G）：
+
+1. 消息复制到剪贴板，并弹出系统通知展示全文（SourceTree 会丢弃自定义操作的输出，不看通知就看不到消息）；
+2. 光标点在提交框中，按 Cmd+V 粘贴；
+3. 在提交框中审阅、修改后提交。
+
+全程不改变窗口焦点，不会未经确认就写入提交框，也不会覆盖你已写的草稿。
+
+等价命令行：`stai gen`；`stai gen --edit` 会先弹出可编辑对话框，确认后再复制。
+
+### 钩子兜底（零操作）
+
+直接提交且提交框留空时，`prepare-commit-msg` 钩子会自动生成信息并填入提交框。
+
+以下情况不会处理：merge / squash / `commit --amend` 类提交，以及已有信息的提交。
+生成失败只打印警告，不会阻断提交（内部 120 秒超时保护）。
 
 临时禁用钩子（不卸载）：`STAI_DISABLE=1 git commit ...`
 
-### 环境变量覆盖
-
-| 变量 | 作用 |
-| --- | --- |
-| `STAI_BASE_URL` / `STAI_API_KEY` / `STAI_MODEL` | 覆盖 provider 配置 |
-| `STAI_DISABLE` | 非空时钩子直接放行 |
-
 ## 配置
 
-全局 `~/.config/stai/config.toml`：
+配置按以下顺序合并，后者覆盖前者：
+
+1. 内置默认值
+2. 全局配置 `~/.config/stai/config.toml`
+3. 仓库配置 `.stai.toml`（位于仓库根目录，可提交进库，用于团队共享约定）
+4. 环境变量（最高优先级，可用于临时覆盖）
+
+全局配置 `~/.config/stai/config.toml` 中的每一项都有默认值，未写出的项使用下表的默认值。
+可以直接复制以下示例作为起点：
 
 ```toml
 [provider]
-base_url = "http://localhost:11434/v1"   # 默认本机 Ollama
-api_key  = ""                             # 本地模型留空
-model    = "qwen2.5-coder:7b"
+base_url        = "http://localhost:11434/v1"
+api_key         = ""
+model           = "qwen2.5-coder:7b"
+timeout_seconds = 120
 
 [commit]
-style    = "conventional"                 # conventional / free
-language = "zh-CN"
+style            = "conventional"
+language         = "zh-CN"
+types            = ["feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"]
+subject_max      = 50
+body_min_lines   = 100
+body_min_files   = 3
+body_max_items   = 5
+max_diff_chars   = 60000
+retries          = 1
 
 [review]
-strict = false                            # true 时 pre-commit 发现高危问题才阻断
+strict = false
+
+[hook]
+timeout_seconds = 120
+
+[notify]
+title    = "stai"
+subtitle = "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框"
+
+[sourcetree]
+action_caption     = "AI 生成提交信息"
+shortcut_key_code  = 5
+shortcut_modifiers = 524288
+shortcut_display   = "⌥G"
+
+[log]
+path = "~/Library/Logs/stai.log"
 ```
 
-仓库级 `.stai.toml`（提交进库，团队共享）：同结构，字段覆盖全局。
+各项说明：
 
-## 路线图
+| 配置项 | 默认值 | 说明 |
+| --- | --- | --- |
+| `provider.base_url` | `http://localhost:11434/v1` | OpenAI 兼容接口地址（Ollama、LM Studio、网关均可） |
+| `provider.api_key` | `""` | 接口密钥，本地模型留空 |
+| `provider.model` | `qwen2.5-coder:7b` | 模型名称 |
+| `provider.timeout_seconds` | `120` | 单次模型请求超时（秒） |
+| `commit.style` | `conventional` | 目前只支持 `conventional`，其他值会报错 |
+| `commit.language` | `zh-CN` | 提交信息语言，`zh-CN` 或 `en` |
+| `commit.types` | `feat` … `ci`（共 10 种） | 允许的 type；不在列表中的输出会被重试，仍不合规则报错 |
+| `commit.subject_max` | `50` | 概要字数上限（提示给模型） |
+| `commit.body_min_lines` | `100` | 改动行数超过该值时才写 body |
+| `commit.body_min_files` | `3` | 涉及文件数超过该值时才写 body |
+| `commit.body_max_items` | `5` | body 最多条目数 |
+| `commit.max_diff_chars` | `60000` | 超过该长度的 diff 会被截断后再发送 |
+| `commit.retries` | `1` | 输出不合规时的重试次数 |
+| `review.strict` | `false` | M2 实现后生效：`true` 时 pre-commit 发现高危问题才阻断 |
+| `hook.timeout_seconds` | `120` | `prepare-commit-msg` 钩子的总超时（秒） |
+| `notify.title` | `stai` | 系统通知标题 |
+| `notify.subtitle` | `提交信息已复制到剪贴板，Cmd+V 粘贴到提交框` | 系统通知副标题 |
+| `sourcetree.action_caption` | `AI 生成提交信息` | SourceTree 自定义操作的菜单名，修改后需重新执行 `stai install` |
+| `sourcetree.shortcut_key_code` | `5` | 快捷键键码，`5` 为 G |
+| `sourcetree.shortcut_modifiers` | `524288` | 修饰键，`524288` 为 Option (⌥) |
+| `sourcetree.shortcut_display` | `⌥G` | 快捷键显示文本 |
+| `log.path` | `~/Library/Logs/stai.log` | 诊断日志路径，记录每次 `gen` 的参数、消息和剪贴板结果 |
 
-- **M1 — commit 信息生成**：`stai gen`（生成+复制）+ `stai hook prepare-commit-msg`
-  （空信息兜底）+ `stai install`。验收：SourceTree 里全流程跑通，不离开 GUI。
-- **M2 — 提交前 review**：`stai review`（自定义操作，建议模式）+ pre-commit 严格模式开关。
-- **M3 — 冲突合并协助**：`stai mergetool` 包装进 `git config mergetool`，
-  逐冲突块「解释 + 推荐 + 采纳/自改」TUI。
+仓库级 `.stai.toml` 使用相同结构，只写需要覆盖的字段即可。
+
+### 环境变量
+
+| 变量 | 作用 |
+| --- | --- |
+| `STAI_BASE_URL` | 覆盖 `provider.base_url` |
+| `STAI_API_KEY` | 覆盖 `provider.api_key` |
+| `STAI_MODEL` | 覆盖 `provider.model` |
+| `STAI_DISABLE` | 非空时钩子直接放行，不生成信息 |
+
+
+## 开发
+
+```bash
+go build ./...                 # 构建
+go test ./...                  # 测试
+go run ./cmd/stai help         # 查看命令帮助
+```
 
 ## 目录结构
 
 ```
 cmd/stai/        CLI 入口与子命令（gen / hook / review / mergetool / install）
-internal/        实现包（按里程碑逐层填充）
-docs/            设计文档与决策记录
+internal/ai      OpenAI 兼容接口客户端与提交信息生成
+internal/config 分层配置加载
+internal/git     git 命令封装（暂存区 diff、钩子路径）
+docs/            设计说明（design.md）
 ```
 
-## 开发
+## 路线图
 
-```bash
-go build ./...        # 构建
-go run ./cmd/stai help
-```
-
-> 注意：本机 Homebrew 的 `go` shim 指向已删除的旧版本目录，临时可用
-> `GOROOT=/opt/homebrew/opt/go/libexec /opt/homebrew/opt/go/bin/go` 代替，建议跑一次
-> `brew relink go` 修复。
+- **M1 — commit 信息生成**（已完成）：`stai gen`（生成并复制）、`stai hook prepare-commit-msg`（空信息兜底）、`stai install`。
+  验收标准：在 SourceTree 中全流程跑通，不离开 GUI。
+- **M2 — 提交前 review**：`stai review`（自定义操作，建议模式）+ pre-commit 严格模式开关。
+- **M3 — 冲突合并协助**：`stai mergetool` 接入 `git config mergetool`，
+  逐冲突块提供「解释 + 推荐 + 采纳/自行修改」的交互界面。

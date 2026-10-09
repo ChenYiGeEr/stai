@@ -83,6 +83,86 @@ strict = false                            # trailing comment
 	}
 }
 
+func TestLoadFileParsesNewKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[commit]
+types = ["feat", "fix"]   # 只允许两种
+subject_max = 72
+max_diff_chars = 8000
+retries = 2
+
+[provider]
+timeout_seconds = 30
+
+[log]
+path = "~/logs/stai.log"
+
+[sourcetree]
+action_caption = "AI 提交"
+shortcut_key_code = 11
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	if err := loadFile(&cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	if got := cfg.Commit.Types; len(got) != 2 || got[0] != "feat" || got[1] != "fix" {
+		t.Errorf("types = %v", got)
+	}
+	if cfg.Commit.SubjectMax != 72 || cfg.Commit.MaxDiffChars != 8000 || cfg.Commit.Retries != 2 {
+		t.Errorf("commit ints not parsed: %+v", cfg.Commit)
+	}
+	if cfg.Provider.TimeoutSec != 30 {
+		t.Errorf("provider.timeout_seconds = %d", cfg.Provider.TimeoutSec)
+	}
+	home, _ := os.UserHomeDir()
+	if want := filepath.Join(home, "logs", "stai.log"); cfg.Log.Path != want {
+		t.Errorf("log.path = %q, want %q", cfg.Log.Path, want)
+	}
+	if cfg.SourceTree.ActionCaption != "AI 提交" || cfg.SourceTree.ShortcutKeyCode != 11 {
+		t.Errorf("sourcetree not parsed: %+v", cfg.SourceTree)
+	}
+}
+
+func TestLoadFileRejectsBadValues(t *testing.T) {
+	cases := map[string]string{
+		"int not a number": "[commit]\nsubject_max = \"fifty\"\n",
+		"array not array": "[commit]\ntypes = \"feat\"\n",
+		"array item bare": "[commit]\ntypes = [feat]\n",
+	}
+	for name, content := range cases {
+		t.Run(name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "config.toml")
+			os.WriteFile(path, []byte(content), 0o644)
+			cfg := Default()
+			if err := loadFile(&cfg, path); err == nil {
+				t.Errorf("expected error")
+			}
+		})
+	}
+}
+
+func TestValidateRejectsEmptyTypes(t *testing.T) {
+	cfg := Default()
+	cfg.Commit.Types = []string{}
+	if err := cfg.validate(); err == nil {
+		t.Errorf("empty commit.types must be rejected")
+	}
+}
+
+func TestValidateRejectsUnsupportedStyle(t *testing.T) {
+	cfg := Default()
+	cfg.Commit.Style = "free"
+	if err := cfg.validate(); err == nil {
+		t.Errorf("unsupported commit.style must be rejected")
+	}
+}
+
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("STAI_BASE_URL", "http://example:9999/v1")
 	t.Setenv("STAI_MODEL", "env-model")
