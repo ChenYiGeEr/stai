@@ -74,13 +74,15 @@ Disable hooks without uninstalling: STAI_DISABLE=1
 }
 
 // cmdGen implements "stai gen": generate a commit message for the staged
-// diff and copy it to the clipboard so it can be pasted into SourceTree.
-// With -edit, the message first shows in an editable macOS dialog; the
-// edited text is what gets copied. An optional positional argument is the
-// repository path (SourceTree passes $REPO).
+// diff and copy it to the clipboard, then surface it in a macOS
+// notification — SourceTree custom actions discard stdout, so without the
+// notification the user would see nothing before pasting. The paste into
+// the commit box is a deliberate user action (Cmd+V), which replaces the
+// old dialog's confirm step. With -edit, the message first shows in an
+// editable macOS dialog; the edited text is what gets copied. An optional
+// positional argument is the repository path (SourceTree passes $REPO).
 func cmdGen(args []string) {
 	fs := flag.NewFlagSet("gen", flag.ExitOnError)
-	copyFlag := fs.Bool("copy", true, "copy the generated message to the clipboard")
 	editFlag := fs.Bool("edit", false, "show the message in an editable dialog before copying")
 	fs.Parse(args)
 
@@ -97,8 +99,6 @@ func cmdGen(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
-	absRepoDir, err := filepath.Abs(repoDir)
-	fatal(err)
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
@@ -119,123 +119,16 @@ func cmdGen(args []string) {
 		}
 		msg = edited
 	}
-	// Preferred: write straight into the SourceTree commit box. Any
-	// failure (no permission, window not found, box not found) falls back
-	// to the clipboard so the workflow never breaks.
-	if fillSourceTreeCommitBox(filepath.Base(absRepoDir), msg) == nil {
-		fmt.Fprintln(os.Stderr, "filled into SourceTree commit box")
-	} else if *copyFlag && copyToClipboard(msg) == nil {
-		fmt.Fprintln(os.Stderr, "copied to clipboard")
+	// The clipboard is the delivery channel; the notification is the only
+	// visible feedback because SourceTree custom actions discard stdout.
+	if err := copyToClipboard(msg); err != nil {
+		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		return
 	}
+	notifyCopied(msg)
+	fmt.Fprintln(os.Stderr, "copied to clipboard")
 	fmt.Println(msg)
 }
-
-// fillSourceTreeCommitBox pastes msg into the commit message field of the
-// repo's SourceTree window via Accessibility scripting — the only channel
-// SourceTree offers, since it has no plugin or scripting API. The real
-// editor is an AXTextArea (an empty box may surface as an AXTextField);
-// writing AXValue only paints the control, so the message evaporates the
-// moment the field gains focus — pasting through the clipboard updates
-// SourceTree's internal model and survives (verified on Sourcetree
-// 4.2.19). Requires the macOS Accessibility permission for the stai
-// binary; any error is returned so the caller can fall back to the
-// clipboard.
-func fillSourceTreeCommitBox(repoName, msg string) error {
-	cmd := exec.Command("osascript", "-e", fillCommitBoxScript, "--", msg, repoName)
-	out, err := cmd.CombinedOutput()
-	if err != nil {
-		return fmt.Errorf("fill SourceTree commit box: %v: %s", err, strings.TrimSpace(string(out)))
-	}
-	return nil
-}
-
-// fillCommitBoxScript: argv = commit message, repo folder name. Switches to
-// the file status view, focuses the commit message field with a real click
-// and pastes msg through the clipboard (the only write that survives focus
-// changes), then restores the previous clipboard and moves the cursor to
-// the end of the pasted text.
-const fillCommitBoxScript = `on run argv
-	set msg to item 1 of argv
-	set repoName to item 2 of argv
-	set oldClip to ""
-	try
-		set oldClip to the clipboard
-	end try
-	tell application "Sourcetree" to activate
-	delay 0.3
-	tell application "System Events"
-		tell process "Sourcetree"
-			set wins to every window whose name contains repoName
-			if (count of wins) is 0 then error "no SourceTree window for " & repoName
-			perform action "AXRaise" of item 1 of wins
-			delay 0.2
-			-- the commit box only lives in the file status view; switching is
-			-- idempotent, so do it every time rather than trusting the state
-			try
-				click menu item "文件状态视图" of menu 1 of menu bar item "查看" of menu bar 1
-			end try
-		end tell
-	end tell
-	delay 0.8
-	set box to my findCommitBox(repoName)
-	if box is missing value then error "commit message field not found"
-	set the clipboard to msg
-	tell application "System Events" to click box
-	delay 0.3
-	tell application "System Events" to keystroke "v" using command down
-	delay 0.5
-	if my boxValue(repoName) does not contain msg then
-		my restoreClipboard(oldClip)
-		error "paste did not stick"
-	end if
-	my restoreClipboard(oldClip)
-	-- the paste lands fully selected; collapse the selection so an
-	-- accidental keystroke cannot wipe the whole message
-	tell application "System Events" to key code 124
-	return "ok"
-end run
-
-on restoreClipboard(oldClip)
-	try
-		if oldClip is not "" then set the clipboard to oldClip
-	end try
-end restoreClipboard
-
--- entire-contents references go stale quickly, so the box is re-located
--- before every interaction; the real editor is an AXTextArea, with an
--- AXTextField as the empty-box fallback
-on findCommitBox(repoName)
-	tell application "System Events"
-		tell process "Sourcetree"
-			set wins to every window whose name contains repoName
-			if (count of wins) is 0 then return missing value
-			set fallback to missing value
-			repeat with el in (get entire contents of item 1 of wins)
-				try
-					if class of el is text area then return el
-					if class of el is text field then set fallback to el
-				end try
-			end repeat
-			return fallback
-		end tell
-	end tell
-	return missing value
-end findCommitBox
-
-on boxValue(repoName)
-	tell application "System Events"
-		tell process "Sourcetree"
-			set wins to every window whose name contains repoName
-			if (count of wins) is 0 then return ""
-			repeat with el in (get entire contents of item 1 of wins)
-				try
-					if class of el is text area then return value of el as text
-				end try
-			end repeat
-		end tell
-	end tell
-	return ""
-end boxValue`
 
 // dialogEdit shows the generated message in an editable macOS dialog. It
 // returns the edited text, or ok=false when the user cancels or the dialog
@@ -426,6 +319,18 @@ func copyToClipboard(s string) error {
 	cmd := exec.Command("pbcopy")
 	cmd.Stdin = strings.NewReader(s)
 	return cmd.Run()
+}
+
+// notifyCopied surfaces the generated message in a macOS notification —
+// SourceTree custom actions swallow stdout, so without it the user would
+// see nothing before pasting. Best-effort: a notification failure must
+// never break an otherwise successful copy.
+func notifyCopied(msg string) {
+	script := `on run argv
+	display notification (item 1 of argv) with title "stai" subtitle "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框"
+end run`
+	cmd := exec.Command("osascript", "-e", script, "--", msg)
+	_ = cmd.Run()
 }
 
 func filepathEvalSymlinks(p string) (string, error) {
