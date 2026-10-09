@@ -93,6 +93,12 @@ func cmdGen(args []string) {
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
+	if repoDir == "" {
+		repoDir, err = os.Getwd()
+		fatal(err)
+	}
+	absRepoDir, err := filepath.Abs(repoDir)
+	fatal(err)
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
@@ -113,18 +119,65 @@ func cmdGen(args []string) {
 		}
 		msg = edited
 	}
-	if *copyFlag && copyToClipboard(msg) == nil {
+	// Preferred: write straight into the SourceTree commit box. Any
+	// failure (no permission, window not found, box not found) falls back
+	// to the clipboard so the workflow never breaks.
+	if fillSourceTreeCommitBox(filepath.Base(absRepoDir), msg) == nil {
+		fmt.Fprintln(os.Stderr, "filled into SourceTree commit box")
+	} else if *copyFlag && copyToClipboard(msg) == nil {
 		fmt.Fprintln(os.Stderr, "copied to clipboard")
 	}
 	fmt.Println(msg)
 }
+
+// fillSourceTreeCommitBox writes msg into the commit message field of the
+// repo's SourceTree window via Accessibility scripting — the only channel
+// SourceTree offers, since it has no plugin or scripting API (verified on
+// Sourcetree 4.2.19: the field is an AXTextField whose role description is
+// the plain "文本栏", as opposed to "搜索文本栏"). Requires the macOS
+// Accessibility permission for the stai binary; any error is returned so
+// the caller can fall back to the clipboard.
+func fillSourceTreeCommitBox(repoName, msg string) error {
+	cmd := exec.Command("osascript", "-e", fillCommitBoxScript, "--", msg, repoName)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		return fmt.Errorf("fill SourceTree commit box: %v: %s", err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// fillCommitBoxScript: argv = commit message, repo folder name. Matches
+// the window whose title contains the repo name, finds the commit message
+// text field deep in the AX tree, writes msg and verifies the readback.
+const fillCommitBoxScript = `on run argv
+	set msg to item 1 of argv
+	set repoName to item 2 of argv
+	tell application "Sourcetree" to activate
+	tell application "System Events"
+		tell process "Sourcetree"
+			set wins to every window whose name contains repoName
+			if (count of wins) is 0 then error "no SourceTree window for " & repoName
+			set els to entire contents of item 1 of wins
+			repeat with el in els
+				try
+					if role of el is "AXTextField" and role description of el is "文本栏" then
+						set value of el to msg
+						if value of el does not contain msg then error "write did not stick"
+						return "ok"
+					end if
+				end try
+			end repeat
+			error "commit message field not found"
+		end tell
+	end tell
+end run`
 
 // dialogEdit shows the generated message in an editable macOS dialog. It
 // returns the edited text, or ok=false when the user cancels or the dialog
 // fails (never block the workflow because of a UI hiccup).
 func dialogEdit(msg string) (edited string, ok bool) {
 	script := `on run argv
-	return text returned of (display dialog "可编辑,确定后复制到剪贴板" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
+	return text returned of (display dialog "可编辑,确定后填入 SourceTree 提交框(失败则复制到剪贴板)" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
 end run`
 	cmd := exec.Command("osascript", "-e", script, "--", msg)
 	out, err := cmd.Output()

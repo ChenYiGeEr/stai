@@ -32,7 +32,7 @@ SourceTree 升级几乎不会影响我们；换用其他 Git GUI（Tower、Fork�
 | AI provider | OpenAI 兼容协议可配置，默认指向本机（Ollama / LM Studio），可改网关 |
 | 使用范围 | 先自用：CLI + 一键导入 SourceTree 自定义操作 |
 | 语言 | Go（单静态二进制，钩子冷启动毫秒级，团队分发只需拷贝一个文件） |
-| commit 信息交互 | 双通道：自定义操作「生成并复制」（人确认）+ 空信息时钩子兜底 |
+| commit 信息交互 | 双通道：自定义操作「生成并填入提交框」（人确认，失败回退复制）+ 空信息时钩子兜底 |
 | 冲突合并中 AI 角色 | 解说员 + 逐冲突建议，AI 不直接写文件（自动解决留作进阶开关） |
 | review 阻断策略 | 先建议后阻断：默认不拦截，严格模式（pre-commit 返回非零）用配置开关，默认关 |
 | 配置作用域 | 双层：全局 `~/.config/stai/config.toml` + 仓库级 `.stai.toml`（可提交，团队共享约定） |
@@ -67,9 +67,13 @@ stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 
 1. **自定义操作（人确认，推荐）**
    SourceTree 里暂存改动 → 菜单栏「动作 → 自定义操作 → AI 生成提交信息」→
-   弹出可编辑对话框，可手动调整 → 点「确定」后自动复制到剪贴板 →
-   粘贴进提交框提交。
-   等价命令行：`stai gen --edit`；`stai gen` 则跳过弹窗直接生成并复制。
+   弹出可编辑对话框，可手动调整 → 点「确定」后直接填入 SourceTree 的
+   提交信息输入框（通过辅助功能脚本定位窗口中的文本栏写入，无需粘贴）→
+   人工确认后提交。填充失败（未授权、窗口未找到等）自动回退为复制到剪贴板。
+   等价命令行：`stai gen --edit`；`stai gen` 则跳过弹窗直接生成并填入提交框。
+
+   首次自动填充前，需在 系统设置 → 隐私与安全性 → 辅助功能 中勾选 stai
+   二进制（系统会自动弹授权提示）；二进制路径变更后可能需要重新勾选。
 
 2. **钩子兜底（零操作）**
    直接提交且提交框留空时，`prepare-commit-msg` 钩子会自动生成信息填进
@@ -131,4 +135,3 @@ go run ./cmd/stai help
 > 注意：本机 Homebrew 的 `go` shim 指向已删除的旧版本目录，临时可用
 > `GOROOT=/opt/homebrew/opt/go/libexec /opt/homebrew/opt/go/bin/go` 代替，建议跑一次
 > `brew relink go` 修复。
-
