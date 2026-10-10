@@ -9,6 +9,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -19,10 +20,13 @@ import (
 	"time"
 
 	"stai/internal/ai"
+	"stai/internal/color"
 	"stai/internal/config"
 	"stai/internal/git"
 	"stai/internal/i18n"
 )
+
+const version = "v0.1.0"
 
 // loadConfig loads the layered config, wires the output language into both
 // the CLI text (i18n) and the AI prompts (ai), and sets the log path.
@@ -96,6 +100,12 @@ func main() {
 		cmdInstall(args)
 	case "uninstall":
 		cmdUninstall(args)
+	case "config":
+		cmdConfig(args)
+	case "doctor":
+		cmdDoctor(args)
+	case "version":
+		fmt.Println(version)
 	case "help", "-h", "--help":
 		usage()
 	default:
@@ -106,7 +116,39 @@ func main() {
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, i18n.T("usage"))
+	header := i18n.T("usage_header")
+	fmt.Fprintln(os.Stderr, color.Cyan(color.Bold(header)))
+
+	groups := []struct {
+		title string
+		cmds  []string
+	}{
+		{i18n.T("usage_group_generate"), []string{"gen", "pr", "pr-title", "stash-msg", "split", "changelog"}},
+		{i18n.T("usage_group_review"), []string{"review", "review-branch"}},
+		{i18n.T("usage_group_explain"), []string{"explain"}},
+		{i18n.T("usage_group_setup"), []string{"install", "uninstall", "config", "doctor", "version"}},
+		{i18n.T("usage_group_system"), []string{"hook", "mergetool"}},
+	}
+
+	maxLen := 0
+	for _, g := range groups {
+		for _, c := range g.cmds {
+			if len(c) > maxLen {
+				maxLen = len(c)
+			}
+		}
+	}
+
+	for _, g := range groups {
+		fmt.Fprintf(os.Stderr, "%s\n", color.Cyan(g.title))
+		for _, c := range g.cmds {
+			key := "usage_cmd_" + strings.ReplaceAll(c, "-", "_")
+			fmt.Fprintf(os.Stderr, "  %s  %s\n",
+				color.Green(fmt.Sprintf("%-*s", maxLen, c)),
+				color.Gray(i18n.T(key)))
+		}
+	}
+	fmt.Fprint(os.Stderr, "\n"+i18n.T("usage_footer"))
 }
 
 // cmdGen implements "stai gen": generate a commit message for the staged
@@ -799,7 +841,14 @@ func cmdInstall(args []string) {
 	if globalPath != "" {
 		_, err := os.Stat(globalPath)
 		if os.IsNotExist(err) && isTerminal(os.Stdin.Fd()) {
-			cfg, selectedActions = runInstallWizard(*noSourceTree)
+			var werr error
+			cfg, selectedActions, werr = runInstallWizard(*noSourceTree)
+			if errors.Is(werr, errWizardCancelled) {
+				os.Exit(0)
+			}
+			if werr != nil {
+				fatal(werr)
+			}
 			wizardRan = true
 		} else if err != nil {
 			fatal(fmt.Errorf("checking config file: %w", err))

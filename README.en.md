@@ -26,6 +26,8 @@ variable overrides it temporarily.
 | File explanation | `stai explain <file>` | ✅ Available (M3-C) |
 | Commit split suggestion | `stai split` | ✅ Available (M3-C) |
 | Changelog generation | `stai changelog [since]` | ✅ Available (M3-C) |
+| Configuration wizard | `stai config` | ✅ Available |
+| Setup diagnosis | `stai doctor` | ✅ Available |
 | Conflict resolution assist | `stai mergetool` | 🚧 Not implemented (M3) — prints a hint only |
 
 ## Prerequisites
@@ -42,9 +44,12 @@ variable overrides it temporarily.
 Run in a repository root (after a global install it works in any repo):
 
 ```bash
-stai install                  # write the three hooks + register nine SourceTree custom actions
+stai install                  # runs the config wizard on first use; writes hooks + registers SourceTree custom actions
 stai install -no-sourcetree   # hooks only, leave SourceTree alone
 stai uninstall                # remove everything install wrote (stai-owned entries only)
+stai config                   # re-run the config wizard (old config is backed up to .bak)
+stai config --path            # print the global config path
+stai doctor                   # check the stai installation and runtime environment
 ```
 
 `install` does the following:
@@ -399,6 +404,7 @@ want to override.
 | `STAI_MODEL` | Overrides `provider.model` |
 | `STAI_LANG` | Overrides `global.lang` (`zh-CN` or `en`) |
 | `STAI_DISABLE` | When non-empty, hooks pass through without generating anything |
+| `NO_COLOR` | When non-empty, disables ANSI colors in usage, wizard and doctor output |
 
 ## Development
 
@@ -411,7 +417,7 @@ go run ./cmd/stai help         # command help
 ## Layout
 
 ```
-cmd/stai/        CLI entrypoint and subcommands (gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall)
+cmd/stai/        CLI entrypoint and subcommands (gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor)
 internal/ai      OpenAI-compatible client; commit/PR-title/PR-description/stash/explain/split/changelog generation and staged/branch review (bilingual prompts)
 internal/config  layered configuration loading
 internal/git     git command wrappers (staged diff, branch diff, working-tree diff, git log, tags, hook paths)

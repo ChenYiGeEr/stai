@@ -517,6 +517,25 @@ func GlobalPath() string {
 	return filepath.Join(home, ".config", "stai", "config.toml")
 }
 
+// BackupGlobal copies the existing global config file to path.bak.
+// If the file does not exist, it returns nil without doing anything.
+func BackupGlobal() error {
+	path := GlobalPath()
+	if path == "" {
+		return fmt.Errorf("cannot determine home directory")
+	}
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil
+	} else if err != nil {
+		return err
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(path+".bak", data, 0o600)
+}
+
 // WriteGlobal writes a fresh, fully-commented config file for the user.
 // Only the values collected by the install wizard are uncommented; every
 // other key is present as a comment so the file doubles as documentation.

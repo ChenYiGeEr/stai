@@ -31,6 +31,8 @@ CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查�
 | 文件解释 | `stai explain <file>` | ✅ 可用（M3-C） |
 | commit 拆分建议 | `stai split` | ✅ 可用（M3-C） |
 | changelog 生成 | `stai changelog [since]` | ✅ 可用（M3-C） |
+| 配置向导 | `stai config` | ✅ 可用 |
+| 安装诊断 | `stai doctor` | ✅ 可用 |
 | 冲突合并协助 | `stai mergetool` | 🚧 未实现（M3），目前仅打印提示 |
 
 ## 前置条件
@@ -45,9 +47,12 @@ CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查�
 在仓库根目录执行（全局安装后，任意仓库都可以运行）：
 
 ```bash
-stai install                  # 写入三个钩子 + 注册九个 SourceTree 自定义操作
+stai install                  # 首次运行会启动配置向导;写入三个钩子 + 注册 SourceTree 自定义动作
 stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 stai uninstall                # 移除 install 写入的一切（只删 stai 自己写的）
+stai config                   # 重新运行配置向导（旧配置自动备份为 .bak）
+stai config --path            # 打印全局配置文件路径
+stai doctor                   # 诊断安装与运行环境
 ```
 
 `install` 会做以下几件事：
@@ -350,6 +355,7 @@ path = "~/Library/Logs/stai.log"
 | `STAI_MODEL` | 覆盖 `provider.model` |
 | `STAI_LANG` | 覆盖 `global.lang`（`zh-CN` 或 `en`） |
 | `STAI_DISABLE` | 非空时钩子直接放行，不生成信息 |
+| `NO_COLOR` | 非空时关闭 usage、wizard、doctor 的 ANSI 颜色 |
 
 
 ## 开发
@@ -363,7 +369,7 @@ go run ./cmd/stai help         # 查看命令帮助
 ## 目录结构
 
 ```
-cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall）
+cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor）
 internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/PR 标题/stash 信息/文件解释/拆分建议/changelog 生成与提交前/分支审查（中英双语提示词）
 internal/config  分层配置加载
 internal/git     git 命令封装（暂存区 diff、分支 diff、工作树 diff、git log、标签、钩子路径）
