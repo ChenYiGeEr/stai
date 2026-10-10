@@ -504,6 +504,260 @@ func expandHome(p string) string {
 	return filepath.Join(home, p[2:])
 }
 
+// ExpandHome replaces a leading "~/" with the user's home directory.
+// It is the exported form used by commands that delete log files and the like.
+func ExpandHome(p string) string { return expandHome(p) }
+
+// GlobalPath returns the path to the global configuration file.
+func GlobalPath() string {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	return filepath.Join(home, ".config", "stai", "config.toml")
+}
+
+// WriteGlobal writes a fresh, fully-commented config file for the user.
+// Only the values collected by the install wizard are uncommented; every
+// other key is present as a comment so the file doubles as documentation.
+func WriteGlobal(cfg Config, lang string) error {
+	path := GlobalPath()
+	if path == "" {
+		return fmt.Errorf("cannot determine home directory")
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		return err
+	}
+
+	var tmpl string
+	if lang == "en" {
+		tmpl = configTemplateEN
+	} else {
+		tmpl = configTemplateZH
+	}
+	content := fmt.Sprintf(tmpl,
+		cfg.Global.Lang,
+		cfg.Provider.BaseURL,
+		cfg.Provider.APIKey,
+		cfg.Provider.Model,
+	)
+	return os.WriteFile(path, []byte(content), 0o600)
+}
+
+const configTemplateZH = `# stai 配置文件
+# 生效顺序(低到高): 内置默认值 < 本文件 < 仓库级 .stai.toml < 环境变量
+# 文档: 见 README.md / README.en.md
+
+[global]
+# 界面语言与 AI 输出语言: zh-CN 或 en
+lang = "%s"
+
+[provider]
+# OpenAI 兼容 API 地址,例如 Ollama 默认 http://localhost:11434/v1
+base_url = %q
+api_key = %q
+# 模型名,例如 qwen2.5-coder:7b
+model = %q
+# 单次请求超时(秒)
+# timeout_seconds = 120
+# 采样温度;0 表示确定性,部分模型只接受 1
+# temperature = 0
+
+[commit]
+# 提交信息风格,目前仅支持 conventional
+# style = "conventional"
+# 允许的 Conventional Commits type
+# types = ["feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"]
+# subject 长度建议
+# subject_max = 50
+# 超过多少行才请求 body
+# body_min_lines = 100
+# 超过多少个文件才请求 body
+# body_min_files = 3
+# body 最多条目数
+# body_max_items = 5
+# diff 截断长度(字节)
+# max_diff_chars = 60000
+# 输出不合规时的重试次数
+# retries = 1
+
+[review]
+# strict = true 时,pre-commit/pre-push 发现高危问题会阻断
+# strict = false
+# 超过多少条问题时,通知改为报告文件路径
+# notify_max_findings = 5
+# 报告文件路径(相对仓库根)
+# report_path = ".git/stai-review.md"
+# 按文件分组审查,每组最大变更行数
+# group_max_lines = 100
+# 并行审查组数
+# concurrency = 4
+# 是否要求模型给出具体修改建议
+# suggest_fixes = true
+# 项目自定义审查规则(字符串数组)
+# rules = []
+# 以下三项若设置,则 review 使用独立模型/地址/密钥
+# base_url = ""
+# api_key = ""
+# model = ""
+# 独立采样温度,不填则继承 provider.temperature
+# temperature = 0.7
+
+[pre_push]
+# 分支审查的对比基准
+# base_ref = "origin/main"
+# strict = true 时,push 前发现高危问题会阻断
+# strict = false
+
+[hook]
+# prepare-commit-msg 钩子超时(秒)
+# timeout_seconds = 120
+
+[notify]
+# 通知标题
+# title = "stai"
+# 通知副标题;空则使用语言默认文案
+# subtitle = ""
+
+[sourcetree]
+# SourceTree 自定义动作菜单文案与快捷键
+# action_caption = "AI 生成提交信息"
+# shortcut_key_code = 5
+# shortcut_modifiers = 524288
+# shortcut_display = "⌥G"
+# review_action_caption = "AI 审查改动"
+# review_shortcut_key_code = 15
+# review_shortcut_modifiers = 524288
+# review_shortcut_display = "⌥R"
+# pr_action_caption = "AI 生成 PR 描述"
+# pr_shortcut_key_code = 35
+# pr_shortcut_modifiers = 524288
+# pr_shortcut_display = "⌥P"
+# review_branch_action_caption = "AI 审查分支"
+# review_branch_shortcut_key_code = 0
+# review_branch_shortcut_modifiers = 0
+# review_branch_shortcut_display = ""
+# stash_msg_action_caption = "AI 生成 stash 信息"
+# stash_msg_shortcut_key_code = 0
+# stash_msg_shortcut_modifiers = 0
+# stash_msg_shortcut_display = ""
+# pr_title_action_caption = "AI 生成 PR 标题"
+# explain_action_caption = "AI 解释选中文件"
+# split_action_caption = "AI 拆分 commit 建议"
+# changelog_action_caption = "AI 生成 changelog"
+
+[log]
+# 诊断日志路径,~ 会自动展开
+# path = "~/Library/Logs/stai.log"
+`
+
+const configTemplateEN = `# stai configuration file
+# Precedence (lowest to highest): built-in defaults < this file < repo .stai.toml < env vars
+# Docs: see README.md / README.en.md
+
+[global]
+# UI and AI output language: zh-CN or en
+lang = "%s"
+
+[provider]
+# OpenAI-compatible API endpoint, e.g. http://localhost:11434/v1 for Ollama
+base_url = %q
+api_key = %q
+# Model name, e.g. qwen2.5-coder:7b
+model = %q
+# Timeout for a single request (seconds)
+# timeout_seconds = 120
+# Sampling temperature; 0 is deterministic, some models only accept 1
+# temperature = 0
+
+[commit]
+# Commit message style; only "conventional" is supported
+# style = "conventional"
+# Allowed Conventional Commits types
+# types = ["feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"]
+# Subject length hint
+# subject_max = 50
+# Request a body only when changed lines exceed this
+# body_min_lines = 100
+# ... or when more than this many files are touched
+# body_min_files = 3
+# Maximum body bullet items
+# body_max_items = 5
+# Diff truncation limit (bytes)
+# max_diff_chars = 60000
+# Retry count when output violates the rules
+# retries = 1
+
+[review]
+# When strict = true, pre-commit/pre-push blocks on high-severity findings
+# strict = false
+# Findings beyond this are sent to the report file instead of the notification
+# notify_max_findings = 5
+# Report file path, relative to the repo root
+# report_path = ".git/stai-review.md"
+# Diff is split into groups; each group's changed lines stay under this
+# group_max_lines = 100
+# Number of groups reviewed in parallel
+# concurrency = 4
+# Ask the model for a concrete fix suggestion per finding
+# suggest_fixes = true
+# Project-specific review rules (array of strings)
+# rules = []
+# If set, review uses a separate endpoint/key/model
+# base_url = ""
+# api_key = ""
+# model = ""
+# Separate sampling temperature; empty inherits provider.temperature
+# temperature = 0.7
+
+[pre_push]
+# Base ref for branch reviews
+# base_ref = "origin/main"
+# When strict = true, push is blocked on high-severity findings
+# strict = false
+
+[hook]
+# prepare-commit-msg hook timeout (seconds)
+# timeout_seconds = 120
+
+[notify]
+# Notification title
+# title = "stai"
+# Notification subtitle; empty means use the language default
+# subtitle = ""
+
+[sourcetree]
+# SourceTree custom-action captions and shortcuts
+# action_caption = "AI 生成提交信息"
+# shortcut_key_code = 5
+# shortcut_modifiers = 524288
+# shortcut_display = "⌥G"
+# review_action_caption = "AI 审查改动"
+# review_shortcut_key_code = 15
+# review_shortcut_modifiers = 524288
+# review_shortcut_display = "⌥R"
+# pr_action_caption = "AI 生成 PR 描述"
+# pr_shortcut_key_code = 35
+# pr_shortcut_modifiers = 524288
+# pr_shortcut_display = "⌥P"
+# review_branch_action_caption = "AI 审查分支"
+# review_branch_shortcut_key_code = 0
+# review_branch_shortcut_modifiers = 0
+# review_branch_shortcut_display = ""
+# stash_msg_action_caption = "AI 生成 stash 信息"
+# stash_msg_shortcut_key_code = 0
+# stash_msg_shortcut_modifiers = 0
+# stash_msg_shortcut_display = ""
+# pr_title_action_caption = "AI 生成 PR 标题"
+# explain_action_caption = "AI 解释选中文件"
+# split_action_caption = "AI 拆分 commit 建议"
+# changelog_action_caption = "AI 生成 changelog"
+
+[log]
+# Diagnostic log path; ~/ is expanded automatically
+# path = "~/Library/Logs/stai.log"
+`
+
 // parseString handles "double-quoted strings" and 'single-quoted' strings.
 func parseString(raw string) (string, error) {
 	if len(raw) >= 2 {

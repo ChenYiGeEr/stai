@@ -789,7 +789,27 @@ func cmdInstall(args []string) {
 	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom actions")
 	fs.Parse(args)
 
-	cfg := loadConfig()
+	var (
+		cfg             config.Config
+		selectedActions []staiAction
+		wizardRan       bool
+	)
+
+	globalPath := config.GlobalPath()
+	if globalPath != "" {
+		_, err := os.Stat(globalPath)
+		if os.IsNotExist(err) && isTerminal(os.Stdin.Fd()) {
+			cfg, selectedActions = runInstallWizard(*noSourceTree)
+			wizardRan = true
+		} else if err != nil {
+			fatal(fmt.Errorf("checking config file: %w", err))
+		} else {
+			cfg = loadConfig()
+		}
+	} else {
+		cfg = loadConfig()
+	}
+
 	exe, err := os.Executable()
 	fatal(err)
 	exe, err = filepathEvalSymlinks(exe)
@@ -841,18 +861,26 @@ exit 0
 	if *noSourceTree {
 		return
 	}
-	if err := installSourceTreeActions(exe, cfg.SourceTree); err != nil {
+
+	actions := selectedActions
+	if !wizardRan {
+		actions = sourceTreeActions(cfg.SourceTree)
+	}
+	if len(actions) == 0 {
+		return
+	}
+	if err := installSourceTreeActions(exe, actions); err != nil {
 		fmt.Fprintf(os.Stderr, i18n.T("install_actions_failed"), err)
 		fmt.Fprintln(os.Stderr, i18n.T("install_add_manually"))
-		for _, a := range sourceTreeActions(cfg.SourceTree) {
+		for _, a := range actions {
 			fmt.Fprintf(os.Stderr, i18n.T("install_caption")+"\n", a.Caption)
 			fmt.Fprintf(os.Stderr, i18n.T("install_script")+"\n", exe)
 			fmt.Fprintf(os.Stderr, i18n.T("install_params")+"\n", a.Params)
 		}
 		return
 	}
-	captions := make([]string, 0, len(sourceTreeActions(cfg.SourceTree)))
-	for _, a := range sourceTreeActions(cfg.SourceTree) {
+	captions := make([]string, 0, len(actions))
+	for _, a := range actions {
 		captions = append(captions, a.Caption)
 	}
 	fmt.Printf(i18n.T("install_registered")+"\n", strings.Join(captions, ", "))
@@ -872,6 +900,13 @@ func cmdUninstall(args []string) {
 	fatal(err)
 	exe, err = filepathEvalSymlinks(exe)
 	fatal(err)
+
+	removeConfig := false
+	if globalPath := config.GlobalPath(); globalPath != "" && isTerminal(os.Stdin.Fd()) {
+		if _, err := os.Stat(globalPath); err == nil {
+			removeConfig = confirm(fmt.Sprintf(i18n.T("uninstall_config_prompt"), globalPath), false)
+		}
+	}
 
 	for _, name := range []string{"prepare-commit-msg", "pre-commit", "pre-push"} {
 		path, err := git.HookPath(name)
@@ -911,6 +946,26 @@ func cmdUninstall(args []string) {
 		return
 	}
 	fmt.Printf(i18n.T("install_removed")+"\n", removed)
+
+	// Delete the log file (best-effort: never block uninstall because of it).
+	if cfg.Log.Path != "" {
+		if err := os.Remove(config.ExpandHome(cfg.Log.Path)); err != nil && !os.IsNotExist(err) {
+			logf("uninstall log removal failed: %v", err)
+			fmt.Fprintf(os.Stderr, i18n.T("uninstall_log_failed")+"\n", err)
+		}
+	}
+
+	if removeConfig {
+		globalPath := config.GlobalPath()
+		if err := os.Remove(globalPath); err == nil {
+			fmt.Printf(i18n.T("uninstall_config_removed")+"\n", globalPath)
+		} else if !os.IsNotExist(err) {
+			logf("uninstall config removal failed: %v", err)
+			fmt.Fprintf(os.Stderr, i18n.T("uninstall_config_failed")+"\n", err)
+		}
+	}
+
+	fmt.Println(i18n.T("uninstall_done"))
 }
 
 // staiAction is one SourceTree custom action entry to register.
@@ -947,8 +1002,8 @@ func sourceTreeActions(st config.SourceTree) []staiAction {
 // "customActions" key is a legacy migration path and no longer feeds the
 // UI. Read-modify-write runs in one JXA script so a crash midway cannot
 // corrupt the file; entries owned by other tools are preserved.
-func installSourceTreeActions(exe string, st config.SourceTree) error {
-	data, err := json.Marshal(sourceTreeActions(st))
+func installSourceTreeActions(exe string, actions []staiAction) error {
+	data, err := json.Marshal(actions)
 	if err != nil {
 		return err
 	}

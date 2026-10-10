@@ -49,13 +49,19 @@ stai uninstall                # remove everything install wrote (stai-owned entr
 
 `install` does the following:
 
-1. Writes a `prepare-commit-msg` hook into the current repo (generates a
+1. If the global config file `~/.config/stai/config.toml` does not exist and
+   stdin is an interactive terminal, it runs a guided wizard: choose the
+   language, enter the provider base URL and API key, pick a model from the
+   `/models` endpoint (or type one manually if the endpoint fails), and select
+   which SourceTree custom actions to register (`all` or a subset). The
+   resulting config file is written before the hooks are installed.
+2. Writes a `prepare-commit-msg` hook into the current repo (generates a
    message when the commit box is left empty; never blocks a commit);
-2. Writes a `pre-commit` hook (reviews and blocks only when
+3. Writes a `pre-commit` hook (reviews and blocks only when
    `review.strict = true`; passes otherwise);
-3. Writes a `pre-push` hook (reviews the branch diff and blocks the push
+4. Writes a `pre-push` hook (reviews the branch diff and blocks the push
    only when `pre_push.strict = true`; passes otherwise);
-4. Registers nine custom actions in SourceTree's action storage,
+5. Registers the selected custom actions in SourceTree's action storage,
    `~/Library/Application Support/SourceTree/actions.plist`. The default
    menu captions are Chinese (fixed defaults, independent of `global.lang`;
    override them via the `sourcetree.*_caption` keys):
@@ -73,10 +79,12 @@ stai uninstall                # remove everything install wrote (stai-owned entr
    (`$REPO` is expanded by SourceTree to the repository path; shortcuts can
    be changed in SourceTree → Settings → Custom Actions.)
 
-Both `install` and `uninstall` are idempotent: install replaces old entries
-pointing at the same binary or carrying the same captions; uninstall removes
-only hooks marked `installed by stai` and stai's action entries — anything
-created by other tools is preserved.
+`uninstall` always removes the hooks, the SourceTree custom actions, and the
+log file. In an interactive terminal it also asks whether to remove the global
+config file. Both `install` and `uninstall` are idempotent: install replaces
+old entries pointing at the same binary or carrying the same captions;
+uninstall removes only hooks marked `installed by stai` and stai's action
+entries — anything created by other tools is preserved.
 
 > **Note**: quit SourceTree before re-running `install`. While running,
 > SourceTree overwrites `actions.plist` from its in-memory list, which

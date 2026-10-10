@@ -103,6 +103,31 @@ var zhCN = map[string]string{
 	"err_pr_invalid":     "PR 标题/描述仍不合规",
 	"err_empty_stash":    "模型返回空 stash message",
 	"err_empty_pr_title": "模型返回空 PR 标题",
+
+	// install wizard
+	"wizard_welcome":          "欢迎使用 stai! 配置不存在,开始引导设置。",
+	"wizard_choose_lang":      "选择语言 / Choose language:",
+	"wizard_lang_zh":          "中文",
+	"wizard_lang_en":          "English",
+	"wizard_base_url":         "Provider base URL",
+	"wizard_api_key":          "Provider API key",
+	"wizard_model_loading":    "正在获取模型列表...",
+	"wizard_model_list_empty": "未获取到模型列表,请手动输入模型名。",
+	"wizard_model_prompt":     "选择模型",
+	"wizard_model_manual":     "无法获取模型列表,请手动输入模型名",
+	"wizard_actions_prompt":   "选择要注册的 SourceTree 自定义动作(输入编号,逗号分隔;直接回车=全部;0=不注册)",
+	"wizard_actions_all":      "将注册全部 SourceTree 自定义动作",
+	"wizard_actions_none":     "跳过 SourceTree 自定义动作",
+	"wizard_actions_done":     "已选择 %d 个 SourceTree 自定义动作",
+	"wizard_config_written":   "配置文件已写入: %s",
+	"wizard_invalid_choice":   "无效选择,请重新输入",
+
+	// uninstall
+	"uninstall_config_prompt":  "是否删除全局配置文件 %s?",
+	"uninstall_config_removed": "配置文件已删除: %s",
+	"uninstall_config_failed":  "删除配置文件失败: %v",
+	"uninstall_log_failed":     "删除日志文件失败: %v",
+	"uninstall_done":           "卸载完成",
 }
 
 // en mirrors zhCN in English.
@@ -209,6 +234,31 @@ Disable hooks without uninstalling: STAI_DISABLE=1
 	"err_pr_invalid":     "PR title/description still violates the rules",
 	"err_empty_stash":    "model returned an empty stash message",
 	"err_empty_pr_title": "model returned an empty PR title",
+
+	// install wizard
+	"wizard_welcome":          "Welcome to stai! No config found; starting guided setup.",
+	"wizard_choose_lang":      "Choose language / 选择语言:",
+	"wizard_lang_zh":          "中文",
+	"wizard_lang_en":          "English",
+	"wizard_base_url":         "Provider base URL",
+	"wizard_api_key":          "Provider API key",
+	"wizard_model_loading":    "Fetching model list...",
+	"wizard_model_list_empty": "No models returned; please enter the model name manually.",
+	"wizard_model_prompt":     "Choose a model",
+	"wizard_model_manual":     "Could not fetch the model list; please enter the model name manually",
+	"wizard_actions_prompt":   "Select SourceTree custom actions to register (enter numbers separated by commas; press Enter for all; 0 for none)",
+	"wizard_actions_all":      "All SourceTree custom actions will be registered",
+	"wizard_actions_none":     "Skipping SourceTree custom actions",
+	"wizard_actions_done":     "Selected %d SourceTree custom actions",
+	"wizard_config_written":   "Config written to: %s",
+	"wizard_invalid_choice":   "Invalid choice; please try again",
+
+	// uninstall
+	"uninstall_config_prompt":  "Remove the global config file %s?",
+	"uninstall_config_removed": "Config file removed: %s",
+	"uninstall_config_failed":  "Failed to remove config file: %v",
+	"uninstall_log_failed":     "Failed to remove log file: %v",
+	"uninstall_done":           "Uninstall complete",
 }
 
 var messages = map[string]map[string]string{
