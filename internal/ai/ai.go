@@ -29,8 +29,9 @@ type Client struct {
 	apiKey      string
 	model       string
 	http        *http.Client
-	sessionID   string  // one per run, so providers can group a conversation
-	Temperature float64 // request temperature; 0 = deterministic. Some models only accept 1 — set it via config.
+	sessionID   string                           // one per run, so providers can group a conversation
+	Temperature float64                          // request temperature; 0 = deterministic. Some models only accept 1 — set it via config.
+	Logf        func(format string, args ...any) // optional debug log; nil means silent
 }
 
 func NewClient(baseURL, apiKey, model string, timeout time.Duration) *Client {
@@ -176,6 +177,9 @@ func (c *Client) GeneratePR(ctx context.Context, cfg config.Commit, diff []byte)
 	body := string(diff)
 	truncated := ""
 	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		if c.Logf != nil {
+			c.Logf("pr diff truncated: %d -> %d chars", len(body), cfg.MaxDiffChars)
+		}
 		body = truncateUTF8(body, cfg.MaxDiffChars)
 		truncated = "\n(Note: the diff was truncated for length.)"
 	}
@@ -220,9 +224,10 @@ func (c *Client) GenerateStashMsg(ctx context.Context, cfg config.Commit, diff [
 
 // Finding is one issue the model found in the staged diff.
 type Finding struct {
-	Severity string // "high", "medium", "low" — "" means an unparsed advisory line
-	Location string // e.g. "internal/ai/ai.go:42"; may be empty
-	Message  string
+	Severity     string // "high", "medium", "low" — "" means an unparsed advisory line
+	Location     string // e.g. "internal/ai/ai.go:42"; may be empty
+	Message      string
+	SuggestedFix string // optional concrete fix/patch suggestion; may be empty
 }
 
 // HasHigh reports whether any finding is high severity.
@@ -243,6 +248,7 @@ type ReviewParams struct {
 	GroupMaxLines int                              // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
 	Concurrency   int                              // groups reviewed in parallel; <= 1 = serial
 	Rules         []string                         // project-specific rules appended to the review prompt
+	SuggestFixes  bool                             // ask the model for a concrete fix suggestion per finding
 	Logf          func(format string, args ...any) // optional per-group progress log
 }
 
@@ -350,7 +356,7 @@ func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, 
 		prefix = fmt.Sprintf("(第 %d/%d 组) ", num, total)
 	}
 	messages := []chatMessage{
-		{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group))},
+		{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group), p.SuggestFixes)},
 		{Role: "user", Content: fmt.Sprintf("%s审查以下暂存 diff:\n\n%s%s", prefix, diff, truncated)},
 	}
 
@@ -361,12 +367,19 @@ func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, 
 	findings, bad := parseReview(raw)
 
 	for attempt := 0; len(bad) > 0 && attempt < p.Retries; attempt++ {
-		messages = append(messages,
-			chatMessage{Role: "assistant", Content: raw},
-			chatMessage{Role: "user", Content: fmt.Sprintf(
-				"上次输出无法解析:%q。请完整重新输出全部问题(包括已正确输出的),每条一行,格式为 [high|medium|low] 文件路径:行号 - 问题描述;没有问题就只输出 OK。",
-				strings.Join(bad, " / "))},
-		)
+		fixHint := ""
+		if p.SuggestFixes {
+			fixHint = ";如某条问题有建议修改,请在该问题下一行输出 '> 建议修改: ...'"
+		}
+		// Start a fresh conversation that resends the diff (the model needs it
+		// to reproduce the findings) instead of replaying the previous raw
+		// reply — that would grow the context on every failed attempt.
+		messages = []chatMessage{
+			{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group), p.SuggestFixes)},
+			{Role: "user", Content: fmt.Sprintf(
+				"上次输出存在无法解析的行:%q。请重新审查并完整输出全部问题(包括已正确输出的),每条一行,格式为 [high|medium|low] 文件路径:行号 - 问题描述%s;没有问题就只输出 OK。\n\n%s审查以下暂存 diff:\n\n%s%s",
+				strings.Join(bad, " / "), fixHint, prefix, diff, truncated)},
+		}
 		raw, err = c.chat(ctx, messages)
 		if err != nil {
 			return nil, err
@@ -385,9 +398,14 @@ func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, 
 	return findings, nil
 }
 
+const reviewFixInstruction = `对每条问题,如果改法不明显,请在紧接着的下一行给出具体修改建议,格式为:
+> 建议修改: <简要说明改哪一行、改成什么,或一段可直接参考的代码片段>
+要求:建议必须是单行文本,不要换行;如需表达多个点,用分号分隔在同一行内。如果改法显而易见(如简单的变量重命名),可以省略建议行。`
+
 // reviewPrompt assembles the system prompt: the base principles, a condensed
-// Go checklist when the group touches Go files, and any project rules.
-func reviewPrompt(rules []string, hasGo bool) string {
+// Go checklist when the group touches Go files, any project rules, and the
+// optional "suggest fixes" instruction.
+func reviewPrompt(rules []string, hasGo, suggestFixes bool) string {
 	var b strings.Builder
 	b.WriteString(reviewSystemPrompt)
 	if hasGo {
@@ -398,6 +416,9 @@ func reviewPrompt(rules []string, hasGo bool) string {
 		for _, r := range rules {
 			b.WriteString("- " + r + "\n")
 		}
+	}
+	if suggestFixes {
+		b.WriteString("\n\n" + reviewFixInstruction)
 	}
 	return b.String()
 }
@@ -569,25 +590,40 @@ func mergeFindings(existing, added []Finding) []Finding {
 }
 
 // parseReview splits a model reply into findings and unparsable lines.
+// A "> 建议修改:" line is attached to a finding only when it directly
+// follows that finding's line — any blank or other line in between resets the
+// association, so a stray suggestion can never bind to the wrong finding.
 func parseReview(raw string) (findings []Finding, bad []string) {
 	s := cleanMessage(raw)
 	if s == "" || strings.EqualFold(s, "OK") || strings.Contains(s, "无问题") && !strings.Contains(s, "[") {
 		return nil, nil
 	}
+	lastIdx := -1
+	prevWasFinding := false
 	for _, line := range strings.Split(s, "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" {
+			prevWasFinding = false
 			continue
 		}
 		if m := reviewFinding.FindStringSubmatch(line); m != nil {
-			findings = append(findings, Finding{
+			f := Finding{
 				Severity: strings.ToLower(m[1]),
 				Location: m[2],
 				Message:  strings.TrimSpace(m[3]),
-			})
-		} else {
-			bad = append(bad, line)
+			}
+			findings = append(findings, f)
+			lastIdx = len(findings) - 1
+			prevWasFinding = true
+			continue
 		}
+		if prevWasFinding && strings.HasPrefix(line, "> 建议修改:") {
+			findings[lastIdx].SuggestedFix = strings.TrimSpace(strings.TrimPrefix(line, "> 建议修改:"))
+			prevWasFinding = false
+			continue
+		}
+		bad = append(bad, line)
+		prevWasFinding = false
 	}
 	return findings, bad
 }
@@ -668,6 +704,71 @@ func containsCJK(s string) bool {
 	return false
 }
 
+// GeneratePRTitle asks the model for a one-line PR title for the given
+// branch diff. It follows the same Conventional Commits style as commit
+// messages but is allowed to be slightly broader (it describes the whole
+// branch, not just the next commit).
+func (c *Client) GeneratePRTitle(ctx context.Context, cfg config.Commit, diff []byte) (string, error) {
+	body := string(diff)
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		if c.Logf != nil {
+			c.Logf("pr-title diff truncated: %d -> %d chars", len(body), cfg.MaxDiffChars)
+		}
+		body = truncateUTF8(body, cfg.MaxDiffChars)
+		truncated = "\n(Note: the diff was truncated for length.)"
+	}
+	files, changedLines := diffStats(diff)
+	messages := []chatMessage{
+		{Role: "system", Content: prTitleSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("分支统计:%d 个文件,%d 行变更(增删合计)。\n\n请为以下分支 diff 生成一行 PR 标题:\n\n%s%s",
+			files, changedLines, body, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	msg := strings.SplitN(cleanMessage(raw), "\n", 2)[0]
+	if msg == "" {
+		return "", fmt.Errorf("模型返回空 PR 标题")
+	}
+	return msg, nil
+}
+
+// GenerateExplanation asks the model to explain the content of a single file
+// (or selected snippet) in plain language. The reply is cleaned but not
+// rigidly validated.
+func (c *Client) GenerateExplanation(ctx context.Context, cfg config.Commit, path string, content []byte) (string, error) {
+	body := string(content)
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		body = truncateUTF8(body, cfg.MaxDiffChars)
+		truncated = "\n(Note: the content was truncated for length.)"
+	}
+	messages := []chatMessage{
+		{Role: "system", Content: explainSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("请解释以下文件 (%s) 的内容和作用:\n\n%s%s", path, body, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	return cleanMessage(raw), nil
+}
+
+func prTitleSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除 type 关键字与专有名词外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是 git PR 标题生成器。严格遵守以下规则:
+1. %s
+2. 只输出一行 PR 标题,不要解释、不要代码围栏、不要引号、不要换行、不要任何前言或后缀。
+3. 标题遵循 Conventional Commits 风格:type(scope): 概要。type 只能取 %s;概要简短,用祈使句描述本次分支的整体目的。
+4. 如果分支改动很小,可以省略 scope;没有更合适 type 时一律用 chore。`,
+		langRule, strings.Join(cfg.Types, "/"))
+}
+
 func prSystemPrompt(cfg config.Commit) string {
 	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
 	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
@@ -694,6 +795,85 @@ func stashMsgSystemPrompt(cfg config.Commit) string {
 2. 只输出一行简短描述,说明当前工作树改动的主题。不要解释、不要代码围栏、不要引号、不要换行、不要任何前言或后缀。
 3. 长度控制在 80 字符以内,优先使用 "feat/fix/refactor/docs/chore/test" 等动词开头(不含 scope)。
 4. 示例:修复登录接口 token 校验;添加用户服务单元测试;重构配置加载逻辑`, langRule)
+}
+
+func explainSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是资深工程师,向同事解释代码。严格遵守以下规则:
+1. %s
+2. 用 2-5 句话概括文件/代码段的核心职责、关键结构和注意事项。
+3. 只输出解释本身,不要代码围栏包裹整段、不要任何前言或后缀。
+4. 如果代码有明显风险或反模式,请一并指出。`, langRule)
+}
+
+// GenerateSplitSuggestion asks the model to group a diff into logical commits.
+// It returns a markdown description of the proposed groups.
+func (c *Client) GenerateSplitSuggestion(ctx context.Context, cfg config.Commit, diff []byte) (string, error) {
+	body := string(diff)
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		body = truncateUTF8(body, cfg.MaxDiffChars)
+		truncated = "\n(Note: the diff was truncated for length.)"
+	}
+	files, changedLines := diffStats(diff)
+	messages := []chatMessage{
+		{Role: "system", Content: splitSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("当前改动:%d 个文件,%d 行变更(增删合计)。\n\n请将以下 diff 拆分为若干个逻辑独立的 commit,给出分组建议:\n\n%s%s",
+			files, changedLines, body, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	return cleanMessage(raw), nil
+}
+
+func splitSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是 git commit 拆分顾问。严格遵守以下规则:
+1. %s
+2. 只输出 markdown 分组建议,不要任何前言或后缀。
+3. 每个 commit 一行标题(遵循 Conventional Commits:type(scope): 概要),下面列出该 commit 应包含的文件列表。
+4. 不要把相互依赖的改动拆到不同 commit;不要把仅因同一 bug 而改的不同文件拆开。
+5. 如果当前改动已经是一个逻辑 commit,直接说明无需拆分。`, langRule)
+}
+
+// GenerateChangelog asks the model for a markdown changelog from the provided
+// git log/diff summary. The caller builds the input from git log and tags.
+func (c *Client) GenerateChangelog(ctx context.Context, cfg config.Commit, input string) (string, error) {
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(input) > cfg.MaxDiffChars {
+		input = truncateUTF8(input, cfg.MaxDiffChars)
+		truncated = "\n(Note: the input was truncated for length.)"
+	}
+	messages := []chatMessage{
+		{Role: "system", Content: changelogSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("请为以下提交历史生成 changelog:\n\n%s%s", input, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	return cleanMessage(raw), nil
+}
+
+func changelogSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是 changelog 撰写者。严格遵守以下规则:
+1. %s
+2. 只输出 markdown 格式的 changelog 本身,不要任何前言或后缀。
+3. 按功能分类(如 Features/Bug Fixes/Refactoring/Docs),每条一行,以 "- " 开头。
+4. 合并语义重复的提交,去除 chore/ci/style 等无用户价值的条目。
+5. 如果提交信息不足,可以简单写 "常规维护与重构"。`, langRule)
 }
 
 // diffStats counts touched files and changed lines (additions + deletions)

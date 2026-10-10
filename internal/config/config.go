@@ -41,6 +41,7 @@ type Review struct {
 	ReportPath        string   // full report location, relative to the repo root
 	GroupMaxLines     int      // diff is reviewed in per-file groups whose changed lines stay under this
 	Concurrency       int      // groups reviewed in parallel; 1 = serial
+	SuggestFixes      bool     // ask the model for a concrete fix suggestion per finding
 	Rules             []string // project-specific rules injected into the review prompt
 	// Optional provider overrides; empty fields inherit [provider]. Lets
 	// review use a stronger model than gen while gen stays on a fast one.
@@ -85,6 +86,10 @@ type SourceTree struct {
 	StashMsgShortcutKeyCode       int    // no shortcut by default (0)
 	StashMsgShortcutModifiers     int    // no shortcut by default (0)
 	StashMsgShortcutDisplay       string // empty when no shortcut
+	PRTitleActionCaption          string // menu caption of the PR title custom action
+	ExplainActionCaption          string // menu caption of the file-explain custom action
+	SplitActionCaption            string // menu caption of the commit-split custom action
+	ChangelogActionCaption        string // menu caption of the changelog custom action
 }
 
 type Log struct {
@@ -128,6 +133,7 @@ func Default() Config {
 			ReportPath:        ".git/stai-review.md",
 			GroupMaxLines:     100,
 			Concurrency:       4,
+			SuggestFixes:      true,
 		},
 		PrePush: PrePush{
 			BaseRef: "origin/main",
@@ -159,6 +165,10 @@ func Default() Config {
 			StashMsgShortcutKeyCode:       0,
 			StashMsgShortcutModifiers:     0,
 			StashMsgShortcutDisplay:       "",
+			PRTitleActionCaption:          "AI 生成 PR 标题",
+			ExplainActionCaption:          "AI 解释选中文件",
+			SplitActionCaption:            "AI 拆分 commit 建议",
+			ChangelogActionCaption:        "AI 生成 changelog",
 		},
 		Log: Log{Path: filepath.Join(home, "Library", "Logs", "stai.log")},
 	}
@@ -322,6 +332,8 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.Review.GroupMaxLines)
 	case "review.concurrency":
 		err = setInt(raw, &cfg.Review.Concurrency)
+	case "review.suggest_fixes":
+		err = setBool(raw, &cfg.Review.SuggestFixes)
 	case "review.rules":
 		err = setStrings(raw, &cfg.Review.Rules)
 	case "review.base_url":
@@ -382,6 +394,14 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.SourceTree.StashMsgShortcutModifiers)
 	case "sourcetree.stash_msg_shortcut_display":
 		err = setString(raw, &cfg.SourceTree.StashMsgShortcutDisplay)
+	case "sourcetree.pr_title_action_caption":
+		err = setString(raw, &cfg.SourceTree.PRTitleActionCaption)
+	case "sourcetree.explain_action_caption":
+		err = setString(raw, &cfg.SourceTree.ExplainActionCaption)
+	case "sourcetree.split_action_caption":
+		err = setString(raw, &cfg.SourceTree.SplitActionCaption)
+	case "sourcetree.changelog_action_caption":
+		err = setString(raw, &cfg.SourceTree.ChangelogActionCaption)
 	case "log.path":
 		var p string
 		if err = setString(raw, &p); err == nil {

@@ -157,6 +157,7 @@ notify_max_findings = 3
 report_path = "/tmp/stai-review.md"
 group_max_lines = 42
 concurrency = 2
+suggest_fixes = false
 rules = ["错误必须 logf", "禁止全局可变状态"]
 base_url = "http://example.test/v1"
 model = "review-model"
@@ -177,13 +178,13 @@ review_shortcut_display = "⌥R"
 		t.Fatal(err)
 	}
 	if !cfg.Review.Strict || cfg.Review.NotifyMaxFindings != 3 || cfg.Review.ReportPath != "/tmp/stai-review.md" ||
-		cfg.Review.GroupMaxLines != 42 || cfg.Review.Concurrency != 2 ||
+		cfg.Review.GroupMaxLines != 42 || cfg.Review.Concurrency != 2 || cfg.Review.SuggestFixes != false ||
 		len(cfg.Review.Rules) != 2 || cfg.Review.Rules[0] != "错误必须 logf" ||
 		cfg.Review.BaseURL != "http://example.test/v1" || cfg.Review.APIKey != "" || cfg.Review.Model != "review-model" {
 		t.Errorf("review not parsed: %+v", cfg.Review)
 	}
-	if d := Default(); d.Review.Concurrency != 4 {
-		t.Errorf("review.concurrency default = %d, want 4", d.Review.Concurrency)
+	if d := Default(); d.Review.Concurrency != 4 || !d.Review.SuggestFixes {
+		t.Errorf("review defaults wrong: %+v", d.Review)
 	}
 	if cfg.Review.Temperature == nil || *cfg.Review.Temperature != 1.5 {
 		t.Errorf("review.temperature not parsed: %+v", cfg.Review.Temperature)
@@ -212,6 +213,10 @@ pr_shortcut_modifiers = 524288
 pr_shortcut_display = "⌥P"
 review_branch_action_caption = "AI 审分支"
 stash_msg_action_caption = "AI stash"
+pr_title_action_caption = "AI PR 标题"
+explain_action_caption = "AI 解释"
+split_action_caption = "AI 拆分"
+changelog_action_caption = "AI changelog"
 `
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		t.Fatal(err)
@@ -227,7 +232,11 @@ stash_msg_action_caption = "AI stash"
 	if cfg.SourceTree.PRActionCaption != "AI PR" || cfg.SourceTree.PRShortcutKeyCode != 35 ||
 		cfg.SourceTree.PRShortcutModifiers != 524288 || cfg.SourceTree.PRShortcutDisplay != "⌥P" ||
 		cfg.SourceTree.ReviewBranchActionCaption != "AI 审分支" ||
-		cfg.SourceTree.StashMsgActionCaption != "AI stash" {
+		cfg.SourceTree.StashMsgActionCaption != "AI stash" ||
+		cfg.SourceTree.PRTitleActionCaption != "AI PR 标题" ||
+		cfg.SourceTree.ExplainActionCaption != "AI 解释" ||
+		cfg.SourceTree.SplitActionCaption != "AI 拆分" ||
+		cfg.SourceTree.ChangelogActionCaption != "AI changelog" {
 		t.Errorf("sourcetree new keys not parsed: %+v", cfg.SourceTree)
 	}
 }
@@ -263,5 +272,33 @@ func TestEnvOverrides(t *testing.T) {
 	applyEnv(&cfg)
 	if cfg.Provider.BaseURL != "http://example:9999/v1" || cfg.Provider.Model != "env-model" {
 		t.Errorf("env not applied: %+v", cfg.Provider)
+	}
+}
+
+func TestSetBoolAcceptsCommonValues(t *testing.T) {
+	for _, tc := range []struct {
+		raw  string
+		want bool
+	}{
+		{"true", true},
+		{"True", true},
+		{"TRUE", true},
+		{"1", true},
+		{"false", false},
+		{"False", false},
+		{"FALSE", false},
+		{"0", false},
+	} {
+		var got bool
+		if err := setBool(tc.raw, &got); err != nil {
+			t.Errorf("setBool(%q) error: %v", tc.raw, err)
+			continue
+		}
+		if got != tc.want {
+			t.Errorf("setBool(%q) = %v, want %v", tc.raw, got, tc.want)
+		}
+	}
+	if err := setBool("maybe", new(bool)); err == nil {
+		t.Error("setBool(maybe) should fail")
 	}
 }

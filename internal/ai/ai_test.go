@@ -425,14 +425,21 @@ func TestSplitDiffFilesHeadersKept(t *testing.T) {
 }
 
 func TestReviewPromptAssembly(t *testing.T) {
-	p := reviewPrompt([]string{"规则一"}, true)
+	p := reviewPrompt([]string{"规则一"}, true, false)
 	if !strings.Contains(p, "Go 专项关注点") || !strings.Contains(p, "规则一") {
 		t.Errorf("rules and Go checklist missing from prompt:\n%s", p)
 	}
 	if !strings.Contains(p, "精确优先于召回") {
 		t.Errorf("precision-over-recall principle missing from base prompt")
 	}
-	p = reviewPrompt(nil, false)
+	if strings.Contains(p, "建议修改") {
+		t.Errorf("prompt must not mention fixes when suggestFixes=false")
+	}
+	p = reviewPrompt(nil, false, true)
+	if !strings.Contains(p, "建议修改") {
+		t.Errorf("fix instruction missing when suggestFixes=true:\n%s", p)
+	}
+	p = reviewPrompt(nil, false, false)
 	if strings.Contains(p, "Go 专项关注点") || strings.Contains(p, "项目附加规则") {
 		t.Errorf("prompt must stay bare without Go files or rules:\n%s", p)
 	}
@@ -620,6 +627,74 @@ func TestGeneratePRAndStashMsg(t *testing.T) {
 	}
 }
 
+func TestGeneratePRTitle(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"feat(auth): 修复 token 校验失败"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Types: []string{"feat", "fix"}, Language: "zh-CN"}
+	title, err := c.GeneratePRTitle(context.Background(), cfg, []byte("diff --git a/login.go"))
+	if err != nil {
+		t.Fatalf("GeneratePRTitle: %v", err)
+	}
+	if title != "feat(auth): 修复 token 校验失败" {
+		t.Errorf("GeneratePRTitle output = %q", title)
+	}
+}
+
+func TestGenerateExplanation(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"该文件是登录模块入口,负责 token 校验。"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Language: "zh-CN"}
+	out, err := c.GenerateExplanation(context.Background(), cfg, "login.go", []byte("package login"))
+	if err != nil {
+		t.Fatalf("GenerateExplanation: %v", err)
+	}
+	if !strings.Contains(out, "登录模块入口") {
+		t.Errorf("GenerateExplanation output = %q", out)
+	}
+}
+
+func TestGenerateSplitSuggestion(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"- commit 1: 修改认证\n  - login.go\n- commit 2: 更新测试\n  - login_test.go"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Types: []string{"feat"}, Language: "zh-CN"}
+	out, err := c.GenerateSplitSuggestion(context.Background(), cfg, []byte("diff --git a/login.go\ndiff --git a/login_test.go"))
+	if err != nil {
+		t.Fatalf("GenerateSplitSuggestion: %v", err)
+	}
+	if !strings.Contains(out, "login.go") || !strings.Contains(out, "login_test.go") {
+		t.Errorf("GenerateSplitSuggestion output = %q", out)
+	}
+}
+
+func TestGenerateChangelog(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"## Bug Fixes\n- 修复 token 校验失败"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Language: "zh-CN"}
+	out, err := c.GenerateChangelog(context.Background(), cfg, "abc123 fix token\ndef456 add test")
+	if err != nil {
+		t.Fatalf("GenerateChangelog: %v", err)
+	}
+	if !strings.Contains(out, "修复 token 校验失败") {
+		t.Errorf("GenerateChangelog output = %q", out)
+	}
+}
+
 func TestParseReviewAcceptsUpperCase(t *testing.T) {
 	findings, bad := parseReview("[HIGH] a/a.go:1 - 空指针\n[MEDIUM] b/b.go:2 - 错误未处理\n[LOW] c/c.go:3 - 命名不佳")
 	if len(bad) != 0 {
@@ -633,6 +708,43 @@ func TestParseReviewAcceptsUpperCase(t *testing.T) {
 	}
 	if !HasHigh(findings) {
 		t.Error("HasHigh must detect uppercase-parsed high finding")
+	}
+}
+
+func TestParseReviewExtractsFix(t *testing.T) {
+	findings, bad := parseReview("[HIGH] a/a.go:1 - 空指针\n> 建议修改: 添加 if p != nil 判断\n[MEDIUM] b/b.go:2 - 错误未处理")
+	if len(bad) != 0 || len(findings) != 2 {
+		t.Fatalf("findings=%+v bad=%v", findings, bad)
+	}
+	if findings[0].SuggestedFix != "添加 if p != nil 判断" {
+		t.Errorf("fix not extracted: %q", findings[0].SuggestedFix)
+	}
+	if findings[1].SuggestedFix != "" {
+		t.Errorf("unexpected fix on second finding: %q", findings[1].SuggestedFix)
+	}
+	// A fix line separated from its finding by a malformed or blank line must
+	// NOT attach (it would bind to the wrong finding).
+	findings, bad = parseReview("[HIGH] a/a.go:1 - 空指针\nmalformed\n> 建议修改: 添加判断")
+	if len(findings) != 1 || len(bad) != 2 {
+		t.Fatalf("expected 1 finding + 2 bad lines: findings=%+v bad=%v", findings, bad)
+	}
+	if findings[0].SuggestedFix != "" {
+		t.Errorf("fix should not attach across a malformed line: %q", findings[0].SuggestedFix)
+	}
+	// Same rule for a blank line in between.
+	findings, _ = parseReview("[HIGH] a/a.go:1 - 空指针\n\n> 建议修改: 添加判断")
+	if findings[0].SuggestedFix != "" {
+		t.Errorf("fix should not attach across a blank line: %q", findings[0].SuggestedFix)
+	}
+	// Two consecutive fix lines: only the first attaches; the second is bad.
+	findings, bad = parseReview("[HIGH] a/a.go:1 - 空指针\n> 建议修改: 方案A\n> 建议修改: 方案B")
+	if findings[0].SuggestedFix != "方案A" || len(bad) != 1 {
+		t.Errorf("second fix line should be bad: findings=%+v bad=%v", findings, bad)
+	}
+	// A standalone fix line with no preceding finding is unparsable.
+	findings, bad = parseReview("> 建议修改: 孤立建议")
+	if len(findings) != 0 || len(bad) != 1 {
+		t.Fatalf("orphan fix should be bad: findings=%+v bad=%v", findings, bad)
 	}
 }
 

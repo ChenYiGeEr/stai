@@ -93,6 +93,76 @@ func WorkingTreeDiffDir(dir string) ([]byte, error) {
 	return out, nil
 }
 
+// runGit runs git with args, capturing stderr (and any partial stdout) so
+// failures carry git's own diagnostics instead of a bare exit status.
+func runGit(args ...string) ([]byte, error) {
+	var stderr bytes.Buffer
+	cmd := exec.Command("git", args...)
+	cmd.Stderr = &stderr
+	out, err := cmd.Output()
+	if err == nil {
+		return out, nil
+	}
+	stderrMsg := strings.TrimSpace(stderr.String())
+	stdoutMsg := strings.TrimSpace(string(out))
+	switch {
+	case stderrMsg != "" && stdoutMsg != "":
+		return nil, fmt.Errorf("%w: %s | stdout: %s", err, stderrMsg, stdoutMsg)
+	case stderrMsg != "":
+		return nil, fmt.Errorf("%w: %s", err, stderrMsg)
+	case stdoutMsg != "":
+		return nil, fmt.Errorf("%w: stdout: %s", err, stdoutMsg)
+	}
+	return nil, err
+}
+
+// LastTag returns the most recent git tag in the current repository.
+func LastTag() (string, error) {
+	return LastTagDir("")
+}
+
+// LastTagDir is LastTag for the repository at dir ("" = current directory).
+func LastTagDir(dir string) (string, error) {
+	args := []string{"describe", "--tags", "--abbrev=0"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := runGit(args...)
+	if err != nil {
+		return "", fmt.Errorf("git describe --tags --abbrev=0: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}
+
+// LogRange returns the oneline log for the range since..until (e.g.
+// "v1.0..HEAD") in the current repository. An empty since is allowed and
+// returns the log for until only — callers that want a bounded range must
+// pass an explicit since (e.g. the last tag) to avoid scanning full history
+// on large repositories.
+func LogRange(since, until string) ([]byte, error) {
+	return LogRangeDir(since, until, "")
+}
+
+// LogRangeDir is LogRange for the repository at dir ("" = current directory).
+func LogRangeDir(since, until, dir string) ([]byte, error) {
+	if until == "" {
+		return nil, errors.New("until ref must not be empty")
+	}
+	ref := until
+	if since != "" {
+		ref = since + ".." + until
+	}
+	args := []string{"log", ref, "--oneline", "--no-decorate", "--no-color"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := runGit(args...)
+	if err != nil {
+		return nil, fmt.Errorf("git log: %w", err)
+	}
+	return out, nil
+}
+
 // HookPath resolves where a hook script belongs for this repository
 // (worktree- and submodule-safe via `git rev-parse --git-path`).
 func HookPath(name string) (string, error) {
