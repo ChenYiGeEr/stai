@@ -22,11 +22,13 @@ SourceTree 升级几乎不会影响我们；换用其他 Git GUI（Tower、Fork�
 | 决策点 | 结论 |
 | --- | --- |
 | 接入形态 | 外部伴侣工具：git 钩子 + SourceTree 自定义操作 + mergetool 包装 |
-| 交付顺序 | M1 commit 信息生成 → M2 提交前 review → M3 冲突合并协助 |
+| 交付顺序 | M1 commit 信息生成 → M2 提交前 review → M3-A/B/C 分支级辅助（PR 描述、分支 review、stash 信息）→ M3 冲突合并协助（暂缓） |
 | AI provider | OpenAI 兼容协议可配置，默认指向本机（Ollama / LM Studio），可改网关 |
 | 使用范围 | 先自用：CLI + 一键导入 SourceTree 自定义操作 |
 | 语言 | Go（单静态二进制，钩子冷启动毫秒级，团队分发只需拷贝一个文件） |
 | commit 信息交互 | 双通道：自定义操作「生成并复制」（系统通知展示全文，Cmd+V 粘贴）+ 空信息时钩子兜底 |
+| PR 描述/stash 信息交互 | 复用 commit 信息的「生成并复制」通道，无新交互形式 |
+| 分支 review 阻断策略 | 复用 M2：默认建议，pre-push 严格模式用独立 `pre_push.strict`，默认关 |
 | 冲突合并中 AI 角色 | 解说员 + 逐冲突建议，AI 不直接写文件（自动解决留作进阶开关） |
 | review 阻断策略 | 先建议后阻断：默认不拦截，严格模式（pre-commit 返回非零）用配置开关，默认关 |
 | 配置作用域 | 双层：全局 `~/.config/stai/config.toml` + 仓库级 `.stai.toml`（可提交，团队共享约定） |

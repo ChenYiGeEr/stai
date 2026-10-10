@@ -50,6 +50,11 @@ type Review struct {
 	Temperature *float64 // nil inherits provider.temperature (some models only accept 1)
 }
 
+type PrePush struct {
+	BaseRef string // ref to compare against, e.g. "origin/main"
+	Strict  bool   // true: pre-push hook blocks push on high-severity findings
+}
+
 type Hook struct {
 	TimeoutSec int // upper bound for the prepare-commit-msg hook
 }
@@ -60,14 +65,26 @@ type Notify struct {
 }
 
 type SourceTree struct {
-	ActionCaption           string // menu caption of the gen custom action
-	ShortcutKeyCode         int    // kVK code of the gen shortcut key (5 = G)
-	ShortcutModifiers       int    // NSEvent modifier flags (524288 = Option)
-	ShortcutDisplay         string // gen shortcut text shown in SourceTree
-	ReviewActionCaption     string // menu caption of the review custom action
-	ReviewShortcutKeyCode   int    // kVK code of the review shortcut key (15 = R)
-	ReviewShortcutModifiers int    // NSEvent modifier flags (524288 = Option)
-	ReviewShortcutDisplay   string // review shortcut text shown in SourceTree
+	ActionCaption                 string // menu caption of the gen custom action
+	ShortcutKeyCode               int    // kVK code of the gen shortcut key (5 = G)
+	ShortcutModifiers             int    // NSEvent modifier flags (524288 = Option)
+	ShortcutDisplay               string // gen shortcut text shown in SourceTree
+	ReviewActionCaption           string // menu caption of the review custom action
+	ReviewShortcutKeyCode         int    // kVK code of the review shortcut key (15 = R)
+	ReviewShortcutModifiers       int    // NSEvent modifier flags (524288 = Option)
+	ReviewShortcutDisplay         string // review shortcut text shown in SourceTree
+	PRActionCaption               string // menu caption of the PR description custom action
+	PRShortcutKeyCode             int    // kVK code of the pr shortcut key (35 = P)
+	PRShortcutModifiers           int    // NSEvent modifier flags (524288 = Option)
+	PRShortcutDisplay             string // pr shortcut text shown in SourceTree
+	ReviewBranchActionCaption     string // menu caption of the branch review custom action
+	ReviewBranchShortcutKeyCode   int    // no shortcut by default (0)
+	ReviewBranchShortcutModifiers int    // no shortcut by default (0)
+	ReviewBranchShortcutDisplay   string // empty when no shortcut
+	StashMsgActionCaption         string // menu caption of the stash message custom action
+	StashMsgShortcutKeyCode       int    // no shortcut by default (0)
+	StashMsgShortcutModifiers     int    // no shortcut by default (0)
+	StashMsgShortcutDisplay       string // empty when no shortcut
 }
 
 type Log struct {
@@ -78,6 +95,7 @@ type Config struct {
 	Provider   Provider
 	Commit     Commit
 	Review     Review
+	PrePush    PrePush
 	Hook       Hook
 	Notify     Notify
 	SourceTree SourceTree
@@ -111,20 +129,36 @@ func Default() Config {
 			GroupMaxLines:     100,
 			Concurrency:       4,
 		},
+		PrePush: PrePush{
+			BaseRef: "origin/main",
+			Strict:  false,
+		},
 		Hook: Hook{TimeoutSec: 120},
 		Notify: Notify{
 			Title:    "stai",
 			Subtitle: "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框",
 		},
 		SourceTree: SourceTree{
-			ActionCaption:           "AI 生成提交信息",
-			ShortcutKeyCode:         5,
-			ShortcutModifiers:       524288,
-			ShortcutDisplay:         "⌥G",
-			ReviewActionCaption:     "AI 审查改动",
-			ReviewShortcutKeyCode:   15, // kVK_ANSI_R
-			ReviewShortcutModifiers: 524288,
-			ReviewShortcutDisplay:   "⌥R",
+			ActionCaption:                 "AI 生成提交信息",
+			ShortcutKeyCode:               5,
+			ShortcutModifiers:             524288,
+			ShortcutDisplay:               "⌥G",
+			ReviewActionCaption:           "AI 审查改动",
+			ReviewShortcutKeyCode:         15, // kVK_ANSI_R
+			ReviewShortcutModifiers:       524288,
+			ReviewShortcutDisplay:         "⌥R",
+			PRActionCaption:               "AI 生成 PR 描述",
+			PRShortcutKeyCode:             35, // kVK_ANSI_P
+			PRShortcutModifiers:           524288,
+			PRShortcutDisplay:             "⌥P",
+			ReviewBranchActionCaption:     "AI 审查分支",
+			ReviewBranchShortcutKeyCode:   0,
+			ReviewBranchShortcutModifiers: 0,
+			ReviewBranchShortcutDisplay:   "",
+			StashMsgActionCaption:         "AI 生成 stash 信息",
+			StashMsgShortcutKeyCode:       0,
+			StashMsgShortcutModifiers:     0,
+			StashMsgShortcutDisplay:       "",
 		},
 		Log: Log{Path: filepath.Join(home, "Library", "Logs", "stai.log")},
 	}
@@ -172,6 +206,9 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Review.Concurrency < 1 {
 		return errors.New("review.concurrency must be at least 1")
+	}
+	if cfg.PrePush.BaseRef == "" {
+		return errors.New("pre_push.base_ref must not be empty")
 	}
 	return nil
 }
@@ -295,6 +332,10 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setString(raw, &cfg.Review.Model)
 	case "review.temperature":
 		err = setFloatPtr(raw, &cfg.Review.Temperature)
+	case "pre_push.base_ref":
+		err = setString(raw, &cfg.PrePush.BaseRef)
+	case "pre_push.strict":
+		err = setBool(raw, &cfg.PrePush.Strict)
 	case "hook.timeout_seconds":
 		err = setInt(raw, &cfg.Hook.TimeoutSec)
 	case "notify.title":
@@ -317,6 +358,30 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.SourceTree.ReviewShortcutModifiers)
 	case "sourcetree.review_shortcut_display":
 		err = setString(raw, &cfg.SourceTree.ReviewShortcutDisplay)
+	case "sourcetree.pr_action_caption":
+		err = setString(raw, &cfg.SourceTree.PRActionCaption)
+	case "sourcetree.pr_shortcut_key_code":
+		err = setInt(raw, &cfg.SourceTree.PRShortcutKeyCode)
+	case "sourcetree.pr_shortcut_modifiers":
+		err = setInt(raw, &cfg.SourceTree.PRShortcutModifiers)
+	case "sourcetree.pr_shortcut_display":
+		err = setString(raw, &cfg.SourceTree.PRShortcutDisplay)
+	case "sourcetree.review_branch_action_caption":
+		err = setString(raw, &cfg.SourceTree.ReviewBranchActionCaption)
+	case "sourcetree.review_branch_shortcut_key_code":
+		err = setInt(raw, &cfg.SourceTree.ReviewBranchShortcutKeyCode)
+	case "sourcetree.review_branch_shortcut_modifiers":
+		err = setInt(raw, &cfg.SourceTree.ReviewBranchShortcutModifiers)
+	case "sourcetree.review_branch_shortcut_display":
+		err = setString(raw, &cfg.SourceTree.ReviewBranchShortcutDisplay)
+	case "sourcetree.stash_msg_action_caption":
+		err = setString(raw, &cfg.SourceTree.StashMsgActionCaption)
+	case "sourcetree.stash_msg_shortcut_key_code":
+		err = setInt(raw, &cfg.SourceTree.StashMsgShortcutKeyCode)
+	case "sourcetree.stash_msg_shortcut_modifiers":
+		err = setInt(raw, &cfg.SourceTree.StashMsgShortcutModifiers)
+	case "sourcetree.stash_msg_shortcut_display":
+		err = setString(raw, &cfg.SourceTree.StashMsgShortcutDisplay)
 	case "log.path":
 		var p string
 		if err = setString(raw, &p); err == nil {

@@ -197,6 +197,49 @@ review_shortcut_display = "⌥R"
 	}
 }
 
+func TestLoadFileParsesPrePushAndNewSourceTreeKeys(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[pre_push]
+base_ref = "origin/develop"
+strict = true
+
+[sourcetree]
+pr_action_caption = "AI PR"
+pr_shortcut_key_code = 35
+pr_shortcut_modifiers = 524288
+pr_shortcut_display = "⌥P"
+review_branch_action_caption = "AI 审分支"
+stash_msg_action_caption = "AI stash"
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	cfg := Default()
+	if err := loadFile(&cfg, path); err != nil {
+		t.Fatal(err)
+	}
+	if cfg.PrePush.BaseRef != "origin/develop" || !cfg.PrePush.Strict {
+		t.Errorf("pre_push not parsed: %+v", cfg.PrePush)
+	}
+	if cfg.SourceTree.PRActionCaption != "AI PR" || cfg.SourceTree.PRShortcutKeyCode != 35 ||
+		cfg.SourceTree.PRShortcutModifiers != 524288 || cfg.SourceTree.PRShortcutDisplay != "⌥P" ||
+		cfg.SourceTree.ReviewBranchActionCaption != "AI 审分支" ||
+		cfg.SourceTree.StashMsgActionCaption != "AI stash" {
+		t.Errorf("sourcetree new keys not parsed: %+v", cfg.SourceTree)
+	}
+}
+
+func TestValidateRejectsEmptyPrePushBaseRef(t *testing.T) {
+	cfg := Default()
+	cfg.PrePush.BaseRef = ""
+	if err := cfg.validate(); err == nil {
+		t.Errorf("empty pre_push.base_ref must be rejected")
+	}
+}
+
 func TestValidateRejectsEmptyTypes(t *testing.T) {
 	cfg := Default()
 	cfg.Commit.Types = []string{}

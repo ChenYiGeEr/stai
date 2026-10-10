@@ -48,6 +48,51 @@ func StagedDiffDir(dir string) ([]byte, error) {
 	return out, nil
 }
 
+// BranchDiffDir returns the diff of the current branch against baseRef
+// (e.g. "origin/main") for the repository at dir ("" = current directory).
+// It uses git's --merge-base form so the comparison is against the merge base
+// of baseRef and HEAD, matching what a PR would show.
+func BranchDiffDir(dir, baseRef string) ([]byte, error) {
+	if baseRef == "" {
+		baseRef = "origin/main"
+	}
+	args := []string{"diff", "--merge-base", baseRef, "HEAD", "--no-ext-diff", "--no-color"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("git diff: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("git diff: %w", err)
+	}
+	return out, nil
+}
+
+// WorkingTreeDiffDir returns the diff of the working tree against HEAD for
+// the repository at dir ("" = current directory). This includes both staged
+// and unstaged changes, matching what `git stash` would capture.
+func WorkingTreeDiffDir(dir string) ([]byte, error) {
+	args := []string{"diff", "HEAD", "--no-ext-diff", "--no-color"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		var ee *exec.ExitError
+		if errors.As(err, &ee) && len(ee.Stderr) > 0 {
+			return nil, fmt.Errorf("git diff: %s", strings.TrimSpace(string(ee.Stderr)))
+		}
+		return nil, fmt.Errorf("git diff: %w", err)
+	}
+	if len(bytes.TrimSpace(out)) == 0 {
+		return nil, errors.New("no working tree changes — nothing to stash")
+	}
+	return out, nil
+}
+
 // HookPath resolves where a hook script belongs for this repository
 // (worktree- and submodule-safe via `git rev-parse --git-path`).
 func HookPath(name string) (string, error) {

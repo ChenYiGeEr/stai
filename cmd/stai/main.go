@@ -33,6 +33,12 @@ func main() {
 	switch cmd {
 	case "gen":
 		cmdGen(args)
+	case "pr":
+		cmdPR(args)
+	case "review-branch":
+		cmdReviewBranch(args)
+	case "stash-msg":
+		cmdStashMsg(args)
 	case "hook":
 		cmdHook(args)
 	case "review":
@@ -59,19 +65,25 @@ Usage:
   stai <command> [flags]
 
 Commands:
-  gen        Generate a commit message from staged changes and copy it
-             to the clipboard (M1)
-  hook       Entrypoint for git hooks:
-             stai hook prepare-commit-msg <msg-file> [source]
-             stai hook pre-commit
-  review     AI review of the staged changes (M2). Advisory by default;
-             -strict exits non-zero on high-severity findings.
-             Optional positional argument: the repository path.
-  mergetool  Resolve conflicts with per-hunk AI suggestions (M3)
-  install    Write the prepare-commit-msg and pre-commit hooks and
-             register the SourceTree custom actions (M1+M2)
-  uninstall  Remove everything install wrote (stai-owned hooks and
-             custom actions only)
+  gen          Generate a commit message from staged changes and copy it
+               to the clipboard (M1)
+  hook         Entrypoint for git hooks:
+               stai hook prepare-commit-msg <msg-file> [source]
+               stai hook pre-commit
+               stai hook pre-push
+  pr           Generate a PR description from the branch diff and copy it
+               to the clipboard (M3-A)
+  review       AI review of the staged changes (M2). Advisory by default;
+               -strict exits non-zero on high-severity findings.
+               Optional positional argument: the repository path.
+  review-branch AI review of the current branch against its base ref (M3-B).
+               Advisory by default; -strict exits non-zero.
+  stash-msg    Generate a stash message from working-tree changes and copy
+               it to the clipboard (M3-C)
+  mergetool    Resolve conflicts with per-hunk AI suggestions (M3)
+  install      Write the git hooks and register the SourceTree custom actions
+  uninstall    Remove everything install wrote (stai-owned hooks and
+               custom actions only)
 
 Config: ~/.config/stai/config.toml + per-repo .stai.toml
 Env overrides: STAI_BASE_URL, STAI_API_KEY, STAI_MODEL
@@ -143,6 +155,217 @@ func generate(ctx context.Context, cfg config.Config, diff []byte) (string, erro
 	return client.GenerateCommit(ctx, cfg.Commit, diff)
 }
 
+// hookPrePush implements the strict-mode pre-push gate (M3-B). It only
+// acts when pre_push.strict is enabled: the branch diff against
+// pre_push.base_ref is reviewed and the push is blocked (exit 1) when a
+// high-severity finding is present. AI or parse failures never block a push.
+func hookPrePush() {
+	if os.Getenv("STAI_DISABLE") != "" {
+		return
+	}
+	cfg, err := config.Load()
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		return
+	}
+	logPath = cfg.Log.Path
+	logf("hook pre-push start strict=%v base=%s", cfg.PrePush.Strict, cfg.PrePush.BaseRef)
+	if !cfg.PrePush.Strict {
+		return // advisory branch review happens on demand via "stai review-branch"
+	}
+
+	diff, err := git.BranchDiffDir(".", cfg.PrePush.BaseRef)
+	if err != nil {
+		logf("hook pre-push: %v (passing)", err)
+		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		return
+	}
+	if len(bytes.TrimSpace(diff)) == 0 {
+		logf("hook pre-push: no commits ahead of %s", cfg.PrePush.BaseRef)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	defer cancel()
+	findings, err := generateReview(ctx, cfg, diff)
+	if err != nil {
+		logf("hook pre-push: %v (passing)", err)
+		fmt.Fprintf(os.Stderr, "stai: branch review failed, pushing as-is: %v\n", err)
+		return
+	}
+	logf("hook pre-push done findings=%d high=%v", len(findings), ai.HasHigh(findings))
+	if ai.HasHigh(findings) {
+		fmt.Fprintln(os.Stderr, "stai: pre-push 审查发现高危问题,push 已阻断(绕过:STAI_DISABLE=1 或 git push --no-verify):")
+		fmt.Fprint(os.Stderr, renderFindings(findings, true))
+		os.Exit(1)
+	}
+}
+
+// cmdPR implements "stai pr": generate a markdown PR description for the
+// current branch against pre_push.base_ref and copy it to the clipboard.
+func cmdPR(args []string) {
+	fs := flag.NewFlagSet("pr", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := config.Load()
+	fatal(err)
+	logPath = cfg.Log.Path
+
+	repoDir := ""
+	if fs.NArg() > 0 {
+		repoDir = fs.Arg(0)
+	}
+	if repoDir == "" {
+		repoDir, err = os.Getwd()
+		fatal(err)
+	}
+
+	baseRef := cfg.PrePush.BaseRef
+	logf("pr start args=%q model=%s base_url=%s base=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL, baseRef)
+
+	diff, err := git.BranchDiffDir(repoDir, baseRef)
+	fatal(err)
+	if len(bytes.TrimSpace(diff)) == 0 {
+		fmt.Fprintf(os.Stderr, "stai: 当前分支没有领先 %s 的提交\n", baseRef)
+		return
+	}
+
+	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
+		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	client.Temperature = cfg.Provider.Temperature
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	defer cancel()
+	desc, err := client.GeneratePR(ctx, cfg.Commit, diff)
+	fatal(err)
+
+	logf("pr repo=%s base=%s", repoDir, baseRef)
+	if err := writeClipboard(desc); err != nil {
+		logf("pr clipboard write failed: %v", err)
+		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		return
+	}
+	notify(cfg.Notify.Title, "PR 描述已复制到剪贴板", desc)
+	logClipboard("exit", desc)
+	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Println(desc)
+}
+
+// cmdReviewBranch implements "stai review-branch": AI review of the branch
+// diff against pre_push.base_ref (M3-B). Advisory by default; -strict makes
+// it exit non-zero on high-severity findings.
+func cmdReviewBranch(args []string) {
+	fs := flag.NewFlagSet("review-branch", flag.ExitOnError)
+	strictFlag := fs.Bool("strict", false, "exit non-zero on high-severity findings")
+	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
+	fs.Parse(args)
+
+	cfg, err := config.Load()
+	fatal(err)
+	logPath = cfg.Log.Path
+
+	repoDir := ""
+	if fs.NArg() > 0 {
+		repoDir = fs.Arg(0)
+	}
+	if repoDir == "" {
+		repoDir, err = os.Getwd()
+		fatal(err)
+	}
+
+	baseRef := cfg.PrePush.BaseRef
+	reviewBaseURL, _, reviewModel, _ := reviewProvider(cfg)
+	logf("review-branch start args=%q model=%s base_url=%s base=%s", args, reviewModel, reviewBaseURL, baseRef)
+
+	diff, err := git.BranchDiffDir(repoDir, baseRef)
+	fatal(err)
+	if len(bytes.TrimSpace(diff)) == 0 {
+		fmt.Fprintf(os.Stderr, "stai: 当前分支没有领先 %s 的提交\n", baseRef)
+		return
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	defer cancel()
+	findings, err := generateReview(ctx, cfg, diff)
+	if err != nil {
+		logf("review-branch error: %v", err)
+		fatal(err)
+	}
+	logf("review-branch done findings=%d high=%v", len(findings), ai.HasHigh(findings))
+
+	report := renderFindings(findings, !*noColorFlag)
+	fmt.Print(report)
+
+	// Notifications must stay plain-text (no ANSI).
+	plainReport := renderFindings(findings, false)
+	notifBody := plainReport
+	subtitle := "分支审查完成"
+	if len(findings) > cfg.Review.NotifyMaxFindings {
+		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
+			notifBody = fmt.Sprintf("问题较多,完整报告已写入 %s\n\n%s", path, severitySummary(findings))
+			subtitle = "分支审查完成,报告已写入文件"
+		} else {
+			logf("review-branch report file write failed: %v", werr)
+			notifBody = severitySummary(findings)
+		}
+	}
+	notify(cfg.Notify.Title, subtitle, notifBody)
+
+	if (*strictFlag || cfg.PrePush.Strict) && ai.HasHigh(findings) {
+		logf("review-branch blocked push (strict, high severity)")
+		os.Exit(1)
+	}
+}
+
+// cmdStashMsg implements "stai stash-msg": generate a stash message from
+// the working tree diff (staged + unstaged) and copy it to the clipboard.
+func cmdStashMsg(args []string) {
+	fs := flag.NewFlagSet("stash-msg", flag.ExitOnError)
+	fs.Parse(args)
+
+	cfg, err := config.Load()
+	fatal(err)
+	logPath = cfg.Log.Path
+
+	repoDir := ""
+	if fs.NArg() > 0 {
+		repoDir = fs.Arg(0)
+	}
+	if repoDir == "" {
+		repoDir, err = os.Getwd()
+		fatal(err)
+	}
+
+	logf("stash-msg start args=%q model=%s base_url=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL)
+
+	diff, err := git.WorkingTreeDiffDir(repoDir)
+	fatal(err)
+	if len(bytes.TrimSpace(diff)) == 0 {
+		fmt.Fprintln(os.Stderr, "stai: 工作树没有改动")
+		return
+	}
+
+	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
+		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	client.Temperature = cfg.Provider.Temperature
+
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	defer cancel()
+	msg, err := client.GenerateStashMsg(ctx, cfg.Commit, diff)
+	fatal(err)
+
+	logf("stash-msg repo=%s message=%q", repoDir, msg)
+	if err := writeClipboard(msg); err != nil {
+		logf("stash-msg clipboard write failed: %v", err)
+		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		return
+	}
+	notify(cfg.Notify.Title, "stash 信息已复制到剪贴板", msg)
+	logClipboard("exit", msg)
+	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Println(msg)
+}
+
 // dialogEdit shows the generated message in an editable macOS dialog. It
 // returns the edited text, or ok=false when the user cancels or the dialog
 // fails (never block the workflow because of a UI hiccup).
@@ -166,7 +389,7 @@ func cmdHook(args []string) {
 	fs := flag.NewFlagSet("hook", flag.ExitOnError)
 	fs.Parse(args)
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai hook <prepare-commit-msg <msg-file> [source] | pre-commit>")
+		fmt.Fprintln(os.Stderr, "usage: stai hook <prepare-commit-msg <msg-file> [source] | pre-commit | pre-push>")
 		os.Exit(2)
 	}
 	switch fs.Arg(0) {
@@ -174,6 +397,8 @@ func cmdHook(args []string) {
 		hookPrepareCommitMsg(fs.Arg(1), fs.Arg(2))
 	case "pre-commit":
 		hookPreCommit()
+	case "pre-push":
+		hookPrePush()
 	default:
 		fmt.Fprintf(os.Stderr, "unknown hook: %s\n", fs.Arg(0))
 		os.Exit(2)
@@ -268,15 +493,15 @@ func hookPreCommit() {
 	logf("hook pre-commit done findings=%d high=%v", len(findings), ai.HasHigh(findings))
 	if ai.HasHigh(findings) {
 		fmt.Fprintln(os.Stderr, "stai: pre-commit 审查发现高危问题,提交已阻断(绕过:STAI_DISABLE=1 或 git commit --no-verify):")
-		fmt.Fprint(os.Stderr, renderFindings(findings))
+		fmt.Fprint(os.Stderr, renderFindings(findings, true))
 		os.Exit(1)
 	}
 }
 
-// cmdInstall writes the prepare-commit-msg and pre-commit hooks into the
-// current repository and registers the "AI 生成提交信息" and "AI 审查改动"
-// custom actions in SourceTree. Idempotent: stai-owned hooks and actions are
-// replaced, everything else is left alone.
+// cmdInstall writes the prepare-commit-msg, pre-commit, and pre-push hooks
+// into the current repository and registers the SourceTree custom actions
+// (gen, review, pr, review-branch, stash-msg). Idempotent: stai-owned hooks
+// and actions are replaced, everything else is left alone.
 func cmdInstall(args []string) {
 	fs := flag.NewFlagSet("install", flag.ExitOnError)
 	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom actions")
@@ -310,6 +535,18 @@ status=$?
 exit 0
 `, exe),
 		},
+		{
+			"pre-push",
+			fmt.Sprintf(`#!/bin/sh
+# installed by stai — strict-mode pre-push review (see pre_push.strict).
+# Blocks only when stai itself reports high-severity findings (exit 1);
+# passes on every other outcome.
+"%s" hook pre-push
+status=$?
+[ "$status" -eq 1 ] && exit 1
+exit 0
+`, exe),
+		},
 	}
 	for _, h := range hooks {
 		path, err := git.HookPath(h.name)
@@ -332,12 +569,26 @@ Add them manually: SourceTree → Settings → Custom Actions → Add:
   Parameters:    gen $REPO
   Menu caption:  %s
   Script to run: %s
-  Parameters:    review $REPO
-`, err, cfg.SourceTree.ActionCaption, exe, cfg.SourceTree.ReviewActionCaption, exe)
+  Parameters:    review -no-color $REPO
+  Menu caption:  %s
+  Script to run: %s
+  Parameters:    pr $REPO
+  Menu caption:  %s
+  Script to run: %s
+  Parameters:    review-branch -no-color $REPO
+  Menu caption:  %s
+  Script to run: %s
+  Parameters:    stash-msg $REPO
+`, err, cfg.SourceTree.ActionCaption, exe, cfg.SourceTree.ReviewActionCaption, exe,
+			cfg.SourceTree.PRActionCaption, exe,
+			cfg.SourceTree.ReviewBranchActionCaption, exe,
+			cfg.SourceTree.StashMsgActionCaption, exe)
 		return
 	}
-	fmt.Printf("SourceTree custom actions registered: %s, %s (restart SourceTree)\n",
-		cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption)
+	fmt.Printf("SourceTree custom actions registered: %s, %s, %s, %s, %s (restart SourceTree)\n",
+		cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption,
+		cfg.SourceTree.PRActionCaption, cfg.SourceTree.ReviewBranchActionCaption,
+		cfg.SourceTree.StashMsgActionCaption)
 }
 
 // cmdUninstall removes everything install wrote: hooks that carry the
@@ -356,7 +607,7 @@ func cmdUninstall(args []string) {
 	exe, err = filepathEvalSymlinks(exe)
 	fatal(err)
 
-	for _, name := range []string{"prepare-commit-msg", "pre-commit"} {
+	for _, name := range []string{"prepare-commit-msg", "pre-commit", "pre-push"} {
 		path, err := git.HookPath(name)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "stai: %v\n", err)
@@ -391,7 +642,12 @@ func cmdUninstall(args []string) {
 Remove them manually: SourceTree → Settings → Custom Actions:
   %s
   %s
-`, err, cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption)
+  %s
+  %s
+  %s
+`, err, cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption,
+			cfg.SourceTree.PRActionCaption, cfg.SourceTree.ReviewBranchActionCaption,
+			cfg.SourceTree.StashMsgActionCaption)
 		return
 	}
 	fmt.Printf("SourceTree custom actions removed: %d (restart SourceTree)\n", removed)
@@ -399,11 +655,12 @@ Remove them manually: SourceTree → Settings → Custom Actions:
 
 // staiAction is one SourceTree custom action entry to register.
 type staiAction struct {
-	Caption   string `json:"caption"`
-	Params    string `json:"params"`
-	KeyCode   int    `json:"keyCode"`
-	Modifiers int    `json:"modifiers"`
-	Display   string `json:"display"`
+	Caption        string `json:"caption"`
+	Params         string `json:"params"`
+	KeyCode        int    `json:"keyCode"`
+	Modifiers      int    `json:"modifiers"`
+	Display        string `json:"display"`
+	ShowFullOutput bool   `json:"showFullOutput"`
 }
 
 // installSourceTreeActions registers the custom actions in SourceTree's real
@@ -416,8 +673,11 @@ type staiAction struct {
 // corrupt the file; entries owned by other tools are preserved.
 func installSourceTreeActions(exe string, st config.SourceTree) error {
 	data, err := json.Marshal([]staiAction{
-		{st.ReviewActionCaption, "review $REPO", st.ReviewShortcutKeyCode, st.ReviewShortcutModifiers, st.ReviewShortcutDisplay},
-		{st.ActionCaption, "gen $REPO", st.ShortcutKeyCode, st.ShortcutModifiers, st.ShortcutDisplay},
+		{st.ReviewActionCaption, "review -no-color $REPO", st.ReviewShortcutKeyCode, st.ReviewShortcutModifiers, st.ReviewShortcutDisplay, true},
+		{st.ActionCaption, "gen $REPO", st.ShortcutKeyCode, st.ShortcutModifiers, st.ShortcutDisplay, false},
+		{st.PRActionCaption, "pr $REPO", st.PRShortcutKeyCode, st.PRShortcutModifiers, st.PRShortcutDisplay, false},
+		{st.ReviewBranchActionCaption, "review-branch -no-color $REPO", st.ReviewBranchShortcutKeyCode, st.ReviewBranchShortcutModifiers, st.ReviewBranchShortcutDisplay, true},
+		{st.StashMsgActionCaption, "stash-msg $REPO", st.StashMsgShortcutKeyCode, st.StashMsgShortcutModifiers, st.StashMsgShortcutDisplay, false},
 	})
 	if err != nil {
 		return err
@@ -435,7 +695,7 @@ func installSourceTreeActions(exe string, st config.SourceTree) error {
 // or the configured captions) from actions.plist and returns how many were
 // removed. Other tools' entries are preserved.
 func uninstallSourceTreeActions(exe string, st config.SourceTree) (int, error) {
-	captions, err := json.Marshal([]string{st.ActionCaption, st.ReviewActionCaption})
+	captions, err := json.Marshal([]string{st.ActionCaption, st.ReviewActionCaption, st.PRActionCaption, st.ReviewBranchActionCaption, st.StashMsgActionCaption})
 	if err != nil {
 		return 0, err
 	}
@@ -504,7 +764,7 @@ const actionsPlistJXA = `function run(argv) {
 		e.setObjectForKey($.NSNumber.numberWithBool(false), 'fileAction');
 		e.setObjectForKey($.NSNumber.numberWithBool(false), 'logAction');
 		e.setObjectForKey($.NSNumber.numberWithBool(false), 'separateWindow');
-		e.setObjectForKey($.NSNumber.numberWithBool(false), 'showFullOutput');
+		e.setObjectForKey($.NSNumber.numberWithBool(a.showFullOutput), 'showFullOutput');
 		e.setObjectForKey($.NSNumber.numberWithInt(0), 'repoAction');
 		e.setObjectForKey($.NSNumber.numberWithInt(a.keyCode), 'shortcutKeyCode');
 		e.setObjectForKey($.NSNumber.numberWithInt(a.modifiers), 'shortcutKeyModifiers');
@@ -641,6 +901,7 @@ func filepathEvalSymlinks(p string) (string, error) {
 func cmdReview(args []string) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	strictFlag := fs.Bool("strict", false, "exit non-zero on high-severity findings (pre-commit mode)")
+	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
 	fs.Parse(args)
 
 	cfg, err := config.Load()
@@ -661,20 +922,23 @@ func cmdReview(args []string) {
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
-	findings, err := generateReview(context.Background(), cfg, diff)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	defer cancel()
+	findings, err := generateReview(ctx, cfg, diff)
 	if err != nil {
 		logf("review error: %v", err)
 		fatal(err)
 	}
 	logf("review done findings=%d high=%v", len(findings), ai.HasHigh(findings))
 
-	report := renderFindings(findings)
+	report := renderFindings(findings, !*noColorFlag)
 	fmt.Print(report)
 
 	// SourceTree discards stdout, so the report also goes to a
 	// notification: the full text when it fits, otherwise a summary plus
-	// the report-file path.
-	notifBody := report
+	// the report-file path. Notifications must stay plain-text (no ANSI).
+	plainReport := renderFindings(findings, false)
+	notifBody := plainReport
 	subtitle := "审查完成"
 	if len(findings) > cfg.Review.NotifyMaxFindings {
 		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
@@ -732,21 +996,40 @@ func generateReview(ctx context.Context, cfg config.Config, diff []byte) ([]ai.F
 	})
 }
 
+var severityColor = map[string]string{
+	"high":   "\033[31m", // red
+	"medium": "\033[33m", // yellow
+	"low":    "\033[36m", // cyan
+	"":       "\033[90m", // gray for advisory
+}
+
+const colorReset = "\033[0m"
+
 // renderFindings formats findings as a readable report; empty means OK.
-func renderFindings(findings []ai.Finding) string {
+// When color is true, severity labels get ANSI color codes (suitable for
+// terminal and SourceTree's full-output window).
+func renderFindings(findings []ai.Finding, color bool) string {
 	if len(findings) == 0 {
 		return "OK 未发现问题\n"
 	}
 	var b strings.Builder
 	for _, f := range findings {
-		if f.Severity == "" {
-			fmt.Fprintf(&b, "[?] %s\n", f.Message)
-			continue
+		sev := strings.ToUpper(f.Severity)
+		if sev == "" {
+			sev = "?"
 		}
-		if f.Location != "" {
-			fmt.Fprintf(&b, "[%s] %s - %s\n", f.Severity, f.Location, f.Message)
+		prefix := fmt.Sprintf("[%s]", sev)
+		if color {
+			if c := severityColor[f.Severity]; c != "" {
+				prefix = c + prefix + colorReset
+			}
+		}
+		if f.Severity == "" {
+			fmt.Fprintf(&b, "%s %s\n", prefix, f.Message)
+		} else if f.Location != "" {
+			fmt.Fprintf(&b, "%s %s - %s\n", prefix, f.Location, f.Message)
 		} else {
-			fmt.Fprintf(&b, "[%s] %s\n", f.Severity, f.Message)
+			fmt.Fprintf(&b, "%s %s\n", prefix, f.Message)
 		}
 	}
 	return b.String()
@@ -783,7 +1066,7 @@ func writeReportFile(cfg config.Config, repoDir string, findings []ai.Finding) (
 		return "", err
 	}
 	content := fmt.Sprintf("# stai 审查报告\n\n%s\n%s\n",
-		time.Now().Format("2006-01-02 15:04:05"), renderFindings(findings))
+		time.Now().Format("2006-01-02 15:04:05"), renderFindings(findings, false))
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
 	}

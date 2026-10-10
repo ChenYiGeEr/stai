@@ -559,6 +559,84 @@ func TestGenerateReviewParallelFastFail(t *testing.T) {
 }
 
 func TestChatSendsConfiguredTemperature(t *testing.T) {
+	var got float64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Errorf("decode request: %v", err)
+			w.WriteHeader(400)
+			return
+		}
+		got = req.Temperature
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"OK"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	c.Temperature = 0.7
+	if _, err := c.Chat(context.Background(), "system", "user"); err != nil {
+		t.Fatal(err)
+	}
+	if got != 0.7 {
+		t.Errorf("temperature = %v, want 0.7", got)
+	}
+}
+
+func TestGeneratePRAndStashMsg(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		content := ""
+		if len(req.Messages) > 0 {
+			content = req.Messages[len(req.Messages)-1].Content
+		}
+		reply := "OK"
+		if strings.Contains(content, "PR 描述") {
+			reply = "# 修复登录问题\n\n## 摘要\n\n修复了 token 校验失败的 bug。\n\n## 主要改动\n\n- 增加过期检查\n- 修正错误提示"
+		} else if strings.Contains(content, "stash message") {
+			reply = "修复 token 校验"
+		}
+		w.Write([]byte(fmt.Sprintf(`{"choices":[{"message":{"role":"assistant","content":%q}}]}`, reply)))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Types: []string{"feat"}, Language: "zh-CN"}
+
+	desc, err := c.GeneratePR(context.Background(), cfg, []byte("diff --git a/login.go"))
+	if err != nil {
+		t.Fatalf("GeneratePR: %v", err)
+	}
+	if !strings.Contains(desc, "修复登录问题") {
+		t.Errorf("GeneratePR output = %q", desc)
+	}
+
+	msg, err := c.GenerateStashMsg(context.Background(), cfg, []byte("diff --git a/login.go"))
+	if err != nil {
+		t.Fatalf("GenerateStashMsg: %v", err)
+	}
+	if msg != "修复 token 校验" {
+		t.Errorf("GenerateStashMsg output = %q", msg)
+	}
+}
+
+func TestParseReviewAcceptsUpperCase(t *testing.T) {
+	findings, bad := parseReview("[HIGH] a/a.go:1 - 空指针\n[MEDIUM] b/b.go:2 - 错误未处理\n[LOW] c/c.go:3 - 命名不佳")
+	if len(bad) != 0 {
+		t.Fatalf("unexpected bad lines: %v", bad)
+	}
+	if len(findings) != 3 {
+		t.Fatalf("findings = %+v", findings)
+	}
+	if findings[0].Severity != "high" || findings[1].Severity != "medium" || findings[2].Severity != "low" {
+		t.Errorf("severity not normalized to lowercase: %+v", findings)
+	}
+	if !HasHigh(findings) {
+		t.Error("HasHigh must detect uppercase-parsed high finding")
+	}
+}
+
+func TestChatPassesTemperature(t *testing.T) {
 	var got float64 = -1
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var req chatRequest

@@ -7,7 +7,8 @@ stai 是一个独立的命令行工具，通过 Git 标准机制（钩子、自�
 
 1. **commit 信息生成** —— 读暂存区 diff，按 Conventional Commits 生成提交信息（已可用）；
 2. **提交前 code review** —— 对暂存区做 AI 审查，输出问题清单，可选严格模式阻断提交（已可用）；
-3. **冲突合并协助** —— 接管 mergetool，逐冲突块给出解释与推荐解法（规划中，M3）。
+3. **分支级辅助** —— PR 描述生成、分支 diff review、stash message 生成（已可用）；
+4. **冲突合并协助** —— 接管 mergetool，逐冲突块给出解释与推荐解法（规划中，M3）。
 
 ## 状态
 
@@ -15,6 +16,9 @@ stai 是一个独立的命令行工具，通过 Git 标准机制（钩子、自�
 | --- | --- | --- |
 | commit 信息生成 | `stai gen`、`stai hook prepare-commit-msg`、`stai install` | ✅ 可用（M1） |
 | 提交前 review | `stai review`、`stai hook pre-commit`、`stai install` | ✅ 可用（M2） |
+| PR 描述生成 | `stai pr` | ✅ 可用（M3-A） |
+| 分支 review | `stai review-branch`、`stai hook pre-push` | ✅ 可用（M3-B） |
+| stash 信息生成 | `stai stash-msg` | ✅ 可用（M3-C） |
 | 冲突合并协助 | `stai mergetool` | 🚧 未实现（M3），目前仅打印提示 |
 
 ## 前置条件
@@ -29,7 +33,7 @@ stai 是一个独立的命令行工具，通过 Git 标准机制（钩子、自�
 在仓库根目录执行（全局安装后，任意仓库都可以运行）：
 
 ```bash
-stai install                  # 写入两个钩子 + 注册两个 SourceTree 自定义操作
+stai install                  # 写入三个钩子 + 注册五个 SourceTree 自定义操作
 stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 stai uninstall                # 移除 install 写入的一切（只删 stai 自己写的）
 ```
@@ -39,10 +43,15 @@ stai uninstall                # 移除 install 写入的一切（只删 stai 自
 1. 向当前仓库写入 `prepare-commit-msg` 钩子（空提交信息时自动生成，绝不阻断提交）；
 2. 向当前仓库写入 `pre-commit` 钩子（仅在 `review.strict = true` 时审查并阻断高危提交，
    其余情况直接放行）；
-3. 向 SourceTree 的自定义操作存储写入两条条目
+3. 向当前仓库写入 `pre-push` 钩子（仅在 `pre_push.strict = true` 时审查分支 diff 并阻断
+   push，其余情况直接放行）；
+4. 向 SourceTree 的自定义操作存储写入五条条目
    `~/Library/Application Support/SourceTree/actions.plist`：
    - **AI 生成提交信息**，参数 `gen $REPO`，快捷键 **⌥G**；
-   - **AI 审查改动**，参数 `review $REPO`，快捷键 **⌥R**。
+   - **AI 审查改动**，参数 `review $REPO`，快捷键 **⌥R**；
+   - **AI 生成 PR 描述**，参数 `pr $REPO`，快捷键 **⌥P**；
+   - **AI 审查分支**，参数 `review-branch $REPO**，无快捷键（菜单触发）；
+   - **AI 生成 stash 信息**，参数 `stash-msg $REPO`，无快捷键（菜单触发）。
 
    （`$REPO` 由 SourceTree 展开为仓库路径；快捷键可在 SourceTree 设置 → 自定义操作中修改。）
 
@@ -79,6 +88,12 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 在 SourceTree 中暂存改动，执行 **动作 → 自定义操作 → AI 审查改动**（或按 ⌥R）：
 
 - 审查报告直接打印（命令行）或通过系统通知展示（SourceTree）；
+- 两个审查动作（`AI 审查改动`、`AI 审查分支`）默认开启「Show Full Output」，
+  SourceTree 会在动作完成后弹出输出窗口，完整显示报告；
+- 输出中严重度标签为大写 `[HIGH]` / `[MEDIUM]` / `[LOW]`；
+- **SourceTree 动作默认带 `-no-color`**，输出窗口里是无色的纯文本；
+  终端手动执行 `stai review` / `stai review-branch` 仍带颜色；
+- 通知与报告文件保持纯文本。
 - 变更行数超过 `review.group_max_lines`（默认 100）时，diff 按文件分组、
   逐组串行调用模型审查后合并排序（high → low）。小模型面对整份大 diff 会
   稀释注意力漏报问题，逐文件审查能显著缓解（借鉴 alibaba/open-code-review
@@ -96,6 +111,40 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 等价命令行：`stai review`；`stai review -strict` 本次运行按严格模式处理
 （发现高危问题退出码为 1，可用于脚本）。
 
+### 分支级辅助（M3-A/B/C）
+
+#### PR 描述生成（M3-A）
+
+执行 **动作 → 自定义操作 → AI 生成 PR 描述**（或按 ⌥P）：
+
+- 读取当前分支相对于 `pre_push.base_ref`（默认 `origin/main`）的 diff；
+- 生成标准 markdown 三段式 PR 描述（标题 / 摘要 / 主要改动），复制到剪贴板；
+- 系统通知展示全文，贴到 GitHub/GitLab PR 正文即可。
+
+等价命令行：`stai pr`。
+
+#### 分支审查（M3-B）
+
+执行 **动作 → 自定义操作 → AI 审查分支**（菜单触发，无默认快捷键）：
+
+- 审查范围是当前分支相对于 `pre_push.base_ref` 的全部 diff；
+- 其他行为与 `stai review` 一致：报告、通知、报告文件、严重度汇总。
+
+等价命令行：`stai review-branch`；`stai review-branch -strict` 本次严格模式。
+
+`pre_push.strict = true` 时，`git push` 会自动触发分支审查：发现 **high**
+级问题则阻断 push，其余情况放行。默认关闭；AI 故障或解析失败绝不阻断 push。
+绕过方式：`STAI_DISABLE=1 git push ...` 或 `git push --no-verify`。
+
+#### stash 信息生成（M3-C）
+
+执行 **动作 → 自定义操作 → AI 生成 stash 信息**（菜单触发）：
+
+- 读取工作树相对于 HEAD 的改动（staged + unstaged 的已跟踪文件），生成一行简短描述；
+- 复制到剪贴板，贴到 SourceTree 的 Stash 弹窗消息框即可。
+
+等价命令行：`stai stash-msg`。
+
 #### 严格模式（pre-commit 阻断）
 
 `review.strict = true`（全局或仓库配置）时，每次 `git commit` 前都会审查暂存区：
@@ -110,8 +159,9 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 > 提示：审查质量取决于模型能力。建议 gen 用本地小模型（秒级），review 用
 > `review.model` 指向更强的模型；纯本地小模型时把 `review.group_max_lines`
 > 调小（如 50）可进一步提高召回，代价是串行调用次数变多、耗时变长。
+> review-branch 同样继承 `review.*` 的模型与阈值配置。
 
-临时禁用钩子（不卸载）：`STAI_DISABLE=1 git commit ...`
+临时禁用钩子（不卸载）：`STAI_DISABLE=1 git commit ...` 或 `STAI_DISABLE=1 git push ...`
 
 ## 配置
 
@@ -155,6 +205,10 @@ concurrency = 4                                  # 多组审查的并发数；�
 
 [hook]
 timeout_seconds = 120
+
+[pre_push]
+base_ref = "origin/main"  # PR 描述、分支 review、pre-push hook 的比较基线
+strict = false            # true 时 git push 前审查分支 diff，发现 high 则阻断
 
 [notify]
 title    = "stai"
@@ -200,7 +254,9 @@ path = "~/Library/Logs/stai.log"
 | `review.rules` | `[]` | 项目附加审查规则，原样注入审查提示词 |
 | `review.base_url` / `review.api_key` / `review.model` | 继承 `[provider]` | review 专用模型覆盖，留空继承全局；可让 review 用大模型、gen 用本地快模型 |
 | `review.temperature` | 继承 `provider.temperature` | 仅当 review 模型对 temperature 有限制时设置（如只接受 `1` 的推理模型） |
-| `hook.timeout_seconds` | `120` | 钩子的总超时（秒），对 `prepare-commit-msg` 和 `pre-commit` 都生效 |
+| `hook.timeout_seconds` | `120` | 钩子的总超时（秒），对 `prepare-commit-msg`、`pre-commit`、`pre-push` 都生效 |
+| `pre_push.base_ref` | `"origin/main"` | PR 描述、分支 review、pre-push hook 的比较基线 |
+| `pre_push.strict` | `false` | `true` 时 `git push` 前自动审查分支 diff，发现 high 则阻断 push |
 | `notify.title` | `stai` | 系统通知标题 |
 | `notify.subtitle` | `提交信息已复制到剪贴板，Cmd+V 粘贴到提交框` | 生成提交信息的通知副标题 |
 | `sourcetree.action_caption` | `AI 生成提交信息` | 生成提交信息动作的菜单名，修改后需重新执行 `stai install` |
@@ -211,7 +267,13 @@ path = "~/Library/Logs/stai.log"
 | `sourcetree.review_shortcut_key_code` | `15` | 审查快捷键键码，`15` 为 R |
 | `sourcetree.review_shortcut_modifiers` | `524288` | 修饰键，`524288` 为 Option (⌥) |
 | `sourcetree.review_shortcut_display` | `⌥R` | 审查快捷键显示文本 |
-| `log.path` | `~/Library/Logs/stai.log` | 诊断日志路径，记录每次 `gen` / `review` / 钩子的运行情况和剪贴板结果 |
+| `sourcetree.pr_action_caption` | `AI 生成 PR 描述` | PR 描述动作的菜单名 |
+| `sourcetree.pr_shortcut_key_code` | `35` | PR 快捷键键码，`35` 为 P |
+| `sourcetree.pr_shortcut_modifiers` | `524288` | 修饰键，`524288` 为 Option (⌥) |
+| `sourcetree.pr_shortcut_display` | `⌥P` | PR 快捷键显示文本 |
+| `sourcetree.review_branch_action_caption` | `AI 审查分支` | 分支审查动作的菜单名 |
+| `sourcetree.stash_msg_action_caption` | `AI 生成 stash 信息` | stash 信息动作的菜单名 |
+| `log.path` | `~/Library/Logs/stai.log` | 诊断日志路径，记录每次 `gen` / `review` / `pr` / 钩子的运行情况和剪贴板结果 |
 仓库级 `.stai.toml` 使用相同结构，只写需要覆盖的字段即可。
 
 ### 环境变量
@@ -235,10 +297,10 @@ go run ./cmd/stai help         # 查看命令帮助
 ## 目录结构
 
 ```
-cmd/stai/        CLI 入口与子命令（gen / hook / review / mergetool / install / uninstall）
-internal/ai      OpenAI 兼容接口客户端、提交信息生成与提交前审查
-internal/config 分层配置加载
-internal/git     git 命令封装（暂存区 diff、钩子路径）
+cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / review-branch / stash-msg / mergetool / install / uninstall）
+internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/stash 信息生成与提交前/分支审查
+internal/config  分层配置加载
+internal/git     git 命令封装（暂存区 diff、分支 diff、工作树 diff、钩子路径）
 docs/            设计说明（design.md）
 ```
 
@@ -249,5 +311,8 @@ docs/            设计说明（design.md）
 - **M2 — 提交前 review**（已完成）：`stai review`（自定义操作 ⌥R，建议模式）+
   `stai hook pre-commit`（严格模式开关 `review.strict`）+ `stai uninstall`。
   验收标准：SourceTree 中 ⌥R 出报告；strict 模式下高危问题阻断提交，AI 故障不阻断。
+- **M3-A/B/C — 分支级辅助**（已完成）：`stai pr`（PR 描述）、`stai review-branch` /
+  `stai hook pre-push`（分支 review）、`stai stash-msg`（stash 信息）。
+  验收标准：SourceTree 中 ⌥P 生成 PR 描述；review-branch 动作/钩子在分支 diff 上复用 M2 的审查能力。
 - **M3 — 冲突合并协助**：`stai mergetool` 接入 `git config mergetool`，
   逐冲突块提供「解释 + 推荐 + 采纳/自行修改」的交互界面。

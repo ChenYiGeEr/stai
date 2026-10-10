@@ -169,6 +169,55 @@ func (c *Client) GenerateCommit(ctx context.Context, cfg config.Commit, diff []b
 	return msg, nil
 }
 
+// GeneratePR asks the model for a markdown PR description for the given
+// branch diff. The reply is cleaned (strip fences/quotes) but not validated
+// against a rigid schema, so the caller can present whatever the model returns.
+func (c *Client) GeneratePR(ctx context.Context, cfg config.Commit, diff []byte) (string, error) {
+	body := string(diff)
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		body = truncateUTF8(body, cfg.MaxDiffChars)
+		truncated = "\n(Note: the diff was truncated for length.)"
+	}
+	files, changedLines := diffStats(diff)
+	messages := []chatMessage{
+		{Role: "system", Content: prSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("分支统计:%d 个文件,%d 行变更(增删合计)。\n\n请为以下分支 diff 生成 PR 描述:\n\n%s%s",
+			files, changedLines, body, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	return cleanMessage(raw), nil
+}
+
+// GenerateStashMsg asks the model for a concise one-line stash message
+// describing the working tree diff.
+func (c *Client) GenerateStashMsg(ctx context.Context, cfg config.Commit, diff []byte) (string, error) {
+	body := string(diff)
+	truncated := ""
+	if cfg.MaxDiffChars > 0 && len(body) > cfg.MaxDiffChars {
+		body = truncateUTF8(body, cfg.MaxDiffChars)
+		truncated = "\n(Note: the diff was truncated for length.)"
+	}
+	files, changedLines := diffStats(diff)
+	messages := []chatMessage{
+		{Role: "system", Content: stashMsgSystemPrompt(cfg)},
+		{Role: "user", Content: fmt.Sprintf("改动统计:%d 个文件,%d 行变更(增删合计)。\n\n为以下工作树 diff 生成 stash message:\n\n%s%s",
+			files, changedLines, body, truncated)},
+	}
+	raw, err := c.chat(ctx, messages)
+	if err != nil {
+		return "", err
+	}
+	msg := strings.SplitN(cleanMessage(raw), "\n", 2)[0]
+	if msg == "" {
+		return "", fmt.Errorf("模型返回空 stash message")
+	}
+	return msg, nil
+}
+
 // Finding is one issue the model found in the staged diff.
 type Finding struct {
 	Severity string // "high", "medium", "low" — "" means an unparsed advisory line
@@ -197,7 +246,7 @@ type ReviewParams struct {
 	Logf          func(format string, args ...any) // optional per-group progress log
 }
 
-var reviewFinding = regexp.MustCompile(`^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*(.+)$`)
+var reviewFinding = regexp.MustCompile(`(?i)^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*(.+)$`)
 
 // GenerateReview asks the model to review the staged diff and returns the
 // findings. The model must answer with one line per finding in the form
@@ -362,14 +411,14 @@ const reviewSystemPrompt = `你是提交前 code review 审查器。严格遵守
 1. 精确优先于召回:只报告你能在 diff 及其上下文中确认的缺陷,不要猜测,不要报告风格偏好。误报会消耗审阅者的信任。
 2. 不报告确定性工具能发现的问题:格式、未使用的变量/导入、编译器或 go vet、Staticcheck、gofmt 能查出的静态问题一律不报。
 3. 只报告确实存在的问题:缺陷、安全隐患、逻辑错误、明显的性能问题。
-4. 每条问题一行,格式为 [high|medium|low] 文件路径:行号 - 问题描述。high 仅用于会导致缺陷、数据丢失或安全漏洞的问题。
+4. 每条问题一行,格式为 [HIGH|MEDIUM|LOW] 文件路径:行号 - 问题描述。HIGH 仅用于会导致缺陷、数据丢失或安全漏洞的问题。
 5. 问题描述用中文,一行一条,简短具体,指出改什么。
 6. 没有任何问题时只输出 OK,不要输出其他任何内容。
 7. 不要解释、不要代码围栏、不要任何前言或后缀。
 
 示例(有 2 条问题):
-[high] internal/ai/ai.go:102 - err 被覆盖,底层的读取错误会丢失
-[low] cmd/stai/main.go:40 - 超时常量重复定义了两次
+[HIGH] internal/ai/ai.go:102 - err 被覆盖,底层的读取错误会丢失
+[LOW] cmd/stai/main.go:40 - 超时常量重复定义了两次
 
 示例(无问题):
 OK`
@@ -532,7 +581,7 @@ func parseReview(raw string) (findings []Finding, bad []string) {
 		}
 		if m := reviewFinding.FindStringSubmatch(line); m != nil {
 			findings = append(findings, Finding{
-				Severity: m[1],
+				Severity: strings.ToLower(m[1]),
 				Location: m[2],
 				Message:  strings.TrimSpace(m[3]),
 			})
@@ -617,6 +666,34 @@ func containsCJK(s string) bool {
 		}
 	}
 	return false
+}
+
+func prSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是经验丰富的技术 reviewer,为分支 diff 撰写 PR 描述。严格遵守以下规则:
+1. %s
+2. 只输出 markdown 格式的 PR 描述本身,不要解释、不要代码围栏包裹整段描述、不要任何前言或后缀。
+3. 必须包含三级标题:
+   # 标题(一句话概括本次改动的核心目的)
+   ## 摘要(2-4 句话说明背景、动机和影响)
+   ## 主要改动(按文件或主题列 bullet,每条简短具体)
+4. 标题用祈使句风格;改动点一行一条,以 "- " 开头。
+5. 如果改动很小,摘要可以只有 1 句话,但结构保持不变。`, langRule)
+}
+
+func stashMsgSystemPrompt(cfg config.Commit) string {
+	langRule := "输出语言必须是中文(硬性要求,除专有名词与代码标识符外,每个字都必须是中文)。"
+	if !strings.HasPrefix(strings.ToLower(cfg.Language), "zh") {
+		langRule = "The output language must be English."
+	}
+	return fmt.Sprintf(`你是 git stash message 生成器。严格遵守以下规则:
+1. %s
+2. 只输出一行简短描述,说明当前工作树改动的主题。不要解释、不要代码围栏、不要引号、不要换行、不要任何前言或后缀。
+3. 长度控制在 80 字符以内,优先使用 "feat/fix/refactor/docs/chore/test" 等动词开头(不含 scope)。
+4. 示例:修复登录接口 token 校验;添加用户服务单元测试;重构配置加载逻辑`, langRule)
 }
 
 // diffStats counts touched files and changed lines (additions + deletions)
