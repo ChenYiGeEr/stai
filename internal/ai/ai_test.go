@@ -5,9 +5,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -474,6 +476,85 @@ func TestHasGoFiles(t *testing.T) {
 	}
 	if hasGoFiles([]byte("diff --git a/x.py b/x.py\n--- a/x.py\n+++ b/x.py\n+x")) {
 		t.Errorf("non-Go chunk misdetected")
+	}
+}
+
+func TestGenerateReviewParallel(t *testing.T) {
+	// Three groups, concurrency 2: groups must overlap, merge and stay sorted.
+	var inFlight, peak int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		atomic.AddInt64(&inFlight, 1)
+		if cur := atomic.LoadInt64(&inFlight); cur > atomic.LoadInt64(&peak) {
+			atomic.StoreInt64(&peak, cur)
+		}
+		time.Sleep(30 * time.Millisecond)
+		json.NewEncoder(w).Encode(reply("[medium] x/x.go:1 - 小问题"))
+		atomic.AddInt64(&inFlight, -1)
+	}))
+	defer srv.Close()
+
+	diff := []byte("diff --git a/a/a.go b/a/a.go\n--- a/a/a.go\n+++ b/a/a.go\n@@ -1 +1,2 @@\n+x\n+y\n" +
+		"diff --git a/b/b.go b/b/b.go\n--- a/b/b.go\n+++ b/b.go\n@@ -1 +1,2 @@\n+z\n+w\n" +
+		"diff --git a/c/c.go b/c/c.go\n--- a/c/c.go\n+++ b/c/c.go\n@@ -1 +1,2 @@\n+v\n+u\n")
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: diff, GroupMaxLines: 2, Concurrency: 2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(findings) != 3 {
+		t.Fatalf("findings = %+v", findings)
+	}
+	if peak != 2 {
+		t.Errorf("peak in-flight = %d, want 2 (concurrency limit)", peak)
+	}
+}
+
+func TestGenerateReviewParallelFastFail(t *testing.T) {
+	// The group containing a/a.go fails; the other two must already be
+	// in flight by then (the failing handler waits for their signal), so
+	// cancellation has to abort them — deterministically.
+	var aborted int64
+	slowStarted := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("a/a.go")) {
+			<-slowStarted
+			<-slowStarted
+			http.Error(w, "boom", 500)
+			return
+		}
+		slowStarted <- struct{}{}
+		<-r.Context().Done() // simulate a slow provider until the client aborts
+		atomic.AddInt64(&aborted, 1)
+	}))
+	defer srv.Close()
+
+	diff := []byte("diff --git a/a/a.go b/a/a.go\n--- a/a/a.go\n+++ b/a/a.go\n@@ -1 +1,2 @@\n+x\n+y\n" +
+		"diff --git a/b/b.go b/b/b.go\n--- a/b/b.go\n+++ b/b.go\n@@ -1 +1,2 @@\n+z\n+w\n" +
+		"diff --git a/c/c.go b/c/c.go\n--- a/c/c.go\n+++ b/c/c.go\n@@ -1 +1,2 @@\n+v\n+u\n")
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	started := time.Now()
+	_, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: diff, GroupMaxLines: 2, Concurrency: 3,
+	})
+	if err == nil {
+		t.Fatal("expected error from the failing group")
+	}
+	if !strings.Contains(err.Error(), "500") {
+		t.Errorf("error = %v, want the provider 500 (not a context error)", err)
+	}
+	if elapsed := time.Since(started); elapsed > 5*time.Second {
+		t.Errorf("fast-fail took %s, want < 5s (in-flight groups must abort)", elapsed)
+	}
+	// Server handlers observe the client abort asynchronously; poll.
+	deadline := time.Now().Add(2 * time.Second)
+	for atomic.LoadInt64(&aborted) < 2 {
+		if time.Now().After(deadline) {
+			t.Fatalf("in-flight requests observed no cancellation (aborted=%d)", atomic.LoadInt64(&aborted))
+		}
+		time.Sleep(5 * time.Millisecond)
 	}
 }
 

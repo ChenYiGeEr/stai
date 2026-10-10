@@ -148,6 +148,7 @@ strict = false
 notify_max_findings = 5
 report_path = ".git/stai-review.md"
 group_max_lines = 100
+concurrency = 4                                  # 多组审查的并发数；远端 provider 有效，本地单 GPU 会排队，1 = 串行
 # rules = ["所有新函数的错误必须 logf 或向上返回"]  # 项目附加审查规则
 # base_url = "" / api_key = "" / model = ""        # review 专用模型，留空继承 [provider]
 # temperature = 1                                  # 模型只接受 temperature=1 时设置（如部分推理模型），缺省继承 [provider]
@@ -194,7 +195,8 @@ path = "~/Library/Logs/stai.log"
 | `review.strict` | `false` | `true` 时 pre-commit 发现高危问题才阻断（详见「严格模式」） |
 | `review.notify_max_findings` | `5` | 问题条数超过该值时，通知只给摘要，全文写入报告文件 |
 | `review.report_path` | `.git/stai-review.md` | 完整报告文件路径（相对仓库根目录） |
-| `review.group_max_lines` | `100` | 变更行数超过该值时按文件分组、逐组串行审查后合并（借鉴 open-code-review 的分组阈值） |
+| `review.group_max_lines` | `100` | 变更行数超过该值时按文件分组审查后合并（借鉴 open-code-review 的分组阈值） |
+| `review.concurrency` | `4` | 多组审查的并发数；远端 provider 按并发数缩短墙钟时间，本地单 GPU 会排队，`1` = 串行 |
 | `review.rules` | `[]` | 项目附加审查规则，原样注入审查提示词 |
 | `review.base_url` / `review.api_key` / `review.model` | 继承 `[provider]` | review 专用模型覆盖，留空继承全局；可让 review 用大模型、gen 用本地快模型 |
 | `review.temperature` | 继承 `provider.temperature` | 仅当 review 模型对 temperature 有限制时设置（如只接受 `1` 的推理模型） |

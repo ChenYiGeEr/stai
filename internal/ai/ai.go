@@ -16,6 +16,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -188,10 +189,12 @@ func HasHigh(findings []Finding) bool {
 // ReviewParams carries everything GenerateReview needs.
 type ReviewParams struct {
 	Diff          []byte
-	MaxChars      int      // truncate each group beyond this, telling the model
-	Retries       int      // parse-retry count per group (0 = validate the first reply only)
-	GroupMaxLines int      // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
-	Rules         []string // project-specific rules appended to the review prompt
+	MaxChars      int                              // truncate each group beyond this, telling the model
+	Retries       int                              // parse-retry count per group (0 = validate the first reply only)
+	GroupMaxLines int                              // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
+	Concurrency   int                              // groups reviewed in parallel; <= 1 = serial
+	Rules         []string                         // project-specific rules appended to the review prompt
+	Logf          func(format string, args ...any) // optional per-group progress log
 }
 
 var reviewFinding = regexp.MustCompile(`^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*(.+)$`)
@@ -210,8 +213,11 @@ var reviewFinding = regexp.MustCompile(`^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*
 // them when shown one file at a time. Findings from all groups are merged
 // and sorted high → low.
 func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding, error) {
-	var all []Finding
 	groups := groupDiff(p.Diff, p.GroupMaxLines)
+	if p.Concurrency > 1 && len(groups) > 1 {
+		return c.reviewGroupsParallel(ctx, p, groups)
+	}
+	var all []Finding
 	for i, g := range groups {
 		findings, err := c.reviewGroup(ctx, p, g, i+1, len(groups))
 		if err != nil {
@@ -223,8 +229,66 @@ func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding,
 	return all, nil
 }
 
+// reviewGroupsParallel reviews the groups through a worker pool. Local
+// single-GPU models mostly queue concurrent requests (no speedup, no harm);
+// remote providers run truly in parallel, cutting wall time by the worker
+// count. The first error that occurs cancels everything still queued or in
+// flight (fast-fail, matching the serial mode) and is returned.
+func (c *Client) reviewGroupsParallel(ctx context.Context, p ReviewParams, groups [][]byte) ([]Finding, error) {
+	workers := p.Concurrency
+	if workers > len(groups) {
+		workers = len(groups)
+	}
+	ctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make([][]Finding, len(groups))
+	sem := make(chan struct{}, workers)
+	var wg sync.WaitGroup
+	var errMu sync.Mutex
+	var firstErr error
+	for i, g := range groups {
+		wg.Add(1)
+		go func(i int, g []byte) {
+			defer wg.Done()
+			select {
+			case sem <- struct{}{}:
+			case <-ctx.Done(): // a sibling failed before this group started
+				return
+			}
+			defer func() { <-sem }()
+			findings, err := c.reviewGroup(ctx, p, g, i+1, len(groups))
+			results[i] = findings
+			if err != nil {
+				errMu.Lock()
+				if firstErr == nil {
+					firstErr = err
+				}
+				errMu.Unlock()
+				cancel()
+			}
+		}(i, g)
+	}
+	wg.Wait()
+	if firstErr != nil {
+		return nil, firstErr
+	}
+	var all []Finding
+	for _, findings := range results {
+		all = append(all, findings...)
+	}
+	sortFindings(all)
+	return all, nil
+}
+
 // reviewGroup reviews one diff group (a single call, with parse retries).
-func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, num, total int) ([]Finding, error) {
+func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, num, total int) (findings []Finding, err error) {
+	started := time.Now()
+	defer func() {
+		if p.Logf != nil {
+			p.Logf("review group %d/%d done findings=%d elapsed=%s",
+				num, total, len(findings), time.Since(started).Round(time.Millisecond))
+		}
+	}()
 	diff := string(group)
 	truncated := ""
 	if p.MaxChars > 0 && len(diff) > p.MaxChars {

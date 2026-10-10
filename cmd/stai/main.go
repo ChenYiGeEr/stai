@@ -727,6 +727,8 @@ func generateReview(ctx context.Context, cfg config.Config, diff []byte) ([]ai.F
 		Retries:       cfg.Commit.Retries,
 		GroupMaxLines: cfg.Review.GroupMaxLines,
 		Rules:         cfg.Review.Rules,
+		Concurrency:   cfg.Review.Concurrency,
+		Logf:          logf,
 	})
 }
 

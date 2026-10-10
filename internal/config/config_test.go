@@ -156,6 +156,7 @@ strict = true
 notify_max_findings = 3
 report_path = "/tmp/stai-review.md"
 group_max_lines = 42
+concurrency = 2
 rules = ["错误必须 logf", "禁止全局可变状态"]
 base_url = "http://example.test/v1"
 model = "review-model"
@@ -176,9 +177,13 @@ review_shortcut_display = "⌥R"
 		t.Fatal(err)
 	}
 	if !cfg.Review.Strict || cfg.Review.NotifyMaxFindings != 3 || cfg.Review.ReportPath != "/tmp/stai-review.md" ||
-		cfg.Review.GroupMaxLines != 42 || len(cfg.Review.Rules) != 2 || cfg.Review.Rules[0] != "错误必须 logf" ||
+		cfg.Review.GroupMaxLines != 42 || cfg.Review.Concurrency != 2 ||
+		len(cfg.Review.Rules) != 2 || cfg.Review.Rules[0] != "错误必须 logf" ||
 		cfg.Review.BaseURL != "http://example.test/v1" || cfg.Review.APIKey != "" || cfg.Review.Model != "review-model" {
 		t.Errorf("review not parsed: %+v", cfg.Review)
+	}
+	if d := Default(); d.Review.Concurrency != 4 {
+		t.Errorf("review.concurrency default = %d, want 4", d.Review.Concurrency)
 	}
 	if cfg.Review.Temperature == nil || *cfg.Review.Temperature != 1.5 {
 		t.Errorf("review.temperature not parsed: %+v", cfg.Review.Temperature)

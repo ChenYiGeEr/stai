@@ -40,6 +40,7 @@ type Review struct {
 	NotifyMaxFindings int      // findings beyond this go to the report file, not the notification
 	ReportPath        string   // full report location, relative to the repo root
 	GroupMaxLines     int      // diff is reviewed in per-file groups whose changed lines stay under this
+	Concurrency       int      // groups reviewed in parallel; 1 = serial
 	Rules             []string // project-specific rules injected into the review prompt
 	// Optional provider overrides; empty fields inherit [provider]. Lets
 	// review use a stronger model than gen while gen stays on a fast one.
@@ -108,6 +109,7 @@ func Default() Config {
 			NotifyMaxFindings: 5,
 			ReportPath:        ".git/stai-review.md",
 			GroupMaxLines:     100,
+			Concurrency:       4,
 		},
 		Hook: Hook{TimeoutSec: 120},
 		Notify: Notify{
@@ -167,6 +169,9 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Provider.Temperature < 0 || (cfg.Review.Temperature != nil && *cfg.Review.Temperature < 0) {
 		return errors.New("temperature must not be negative")
+	}
+	if cfg.Review.Concurrency < 1 {
+		return errors.New("review.concurrency must be at least 1")
 	}
 	return nil
 }
@@ -278,6 +283,8 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setString(raw, &cfg.Review.ReportPath)
 	case "review.group_max_lines":
 		err = setInt(raw, &cfg.Review.GroupMaxLines)
+	case "review.concurrency":
+		err = setInt(raw, &cfg.Review.Concurrency)
 	case "review.rules":
 		err = setStrings(raw, &cfg.Review.Rules)
 	case "review.base_url":
