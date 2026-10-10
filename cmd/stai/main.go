@@ -90,8 +90,8 @@ Commands:
                Advisory by default; -strict exits non-zero.
   stash-msg    Generate a stash message from working-tree changes and copy
                it to the clipboard (M3-C)
-  explain      Explain the selected file (M3-C). Designed for SourceTree's
-               $FILE custom-action placeholder.
+  explain      Explain the selected file (M3-C). Accepts -file=$FILE (the
+               SourceTree custom-action form) or a positional path.
   split        Suggest how to split the staged diff into logical commits
                (M3-C)
   changelog    Generate release notes from git log since the last tag or a
@@ -446,18 +446,24 @@ func cmdStashMsg(args []string) {
 	fmt.Println(msg)
 }
 
-// cmdExplain implements "stai explain <file> [repo]": explain the content
-// of a single file. Designed for SourceTree's $FILE custom-action placeholder.
+// cmdExplain implements "stai explain [-file <file>] [<file> [repo]]": explain
+// the content of a single file. Designed for SourceTree's $FILE custom-action
+// placeholder, which the registered action passes as -file=$FILE.
 func cmdExplain(args []string) {
 	fs := flag.NewFlagSet("explain", flag.ExitOnError)
+	fileFlag := fs.String("file", "", "file to explain (SourceTree $FILE)")
 	repoFlag := fs.String("repo", "", "repository path (overrides positional repo)")
 	fs.Parse(args)
 
-	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai explain <file> [repo]")
+	// -file wins (SourceTree action form); positional file is the CLI form.
+	filePath := *fileFlag
+	if filePath == "" && fs.NArg() > 0 {
+		filePath = fs.Arg(0)
+	}
+	if filePath == "" {
+		fmt.Fprintln(os.Stderr, "stai: 请先在文件列表中选中一个文件")
 		os.Exit(2)
 	}
-	filePath := fs.Arg(0)
 	repoDir := *repoFlag
 	if repoDir == "" && fs.NArg() > 1 {
 		repoDir = fs.Arg(1)
