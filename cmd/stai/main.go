@@ -284,7 +284,7 @@ func cmdReviewBranch(args []string) {
 		return
 	}
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
 	findings, err := generateReview(ctx, cfg, diff)
 	if err != nil {
@@ -922,7 +922,7 @@ func cmdReview(args []string) {
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
 	findings, err := generateReview(ctx, cfg, diff)
 	if err != nil {
