@@ -25,7 +25,9 @@ SourceTree 升级几乎不会影响我们；换用其他 Git GUI（Tower、Fork�
 | 交付顺序 | M1 commit 信息生成 → M2 提交前 review → M3-A/B/C 分支级辅助（PR 描述/标题、分支 review、stash 信息、文件解释、commit 拆分建议、changelog）→ M3 冲突合并协助（暂缓） |
 | AI 辅助输出交互 | 统一「生成并复制到剪贴板 + 系统通知」：commit、PR 描述/标题、stash 信息、文件解释、拆分建议、changelog 均通过剪贴板交付，不切换窗口焦点 |
 | review 增强 | 可选 `review.suggest_fixes` 为每条问题请求修改建议；strict 模式仍只阻断 high，AI 故障永不阻断 |
+| PR 描述与标题 | `stai pr` 一次模型调用同时产出标题+描述（F1 契约：剪贴板=标题行+正文整块，通知副标题=标题行，标题按 Conventional Commits 校验不合规重试）；`stai pr-title` 保留专用标题提示词，服务只需一行的场景（squash merge、PR 模板仓库） |
 | 分支 review 阻断策略 | 复用 M2：默认建议，pre-push 严格模式用独立 `pre_push.strict`，默认关 |
 | 冲突合并中 AI 角色 | 解说员 + 逐冲突建议，AI 不直接写文件（自动解决留作进阶开关） |
 | review 阻断策略 | 先建议后阻断：默认不拦截，严格模式（pre-commit 返回非零）用配置开关，默认关 |
 | 配置作用域 | 双层：全局 `~/.config/stai/config.toml` + 仓库级 `.stai.toml`（可提交，团队共享约定） |
+| 界面与输出语言 | `[global] lang`（严格 `zh-CN`/`en`，默认 `zh-CN`，`STAI_LANG` 可覆盖）统一驱动 CLI 文案、通知与全部 AI 提示词；替代早期的 `commit.language`（已移除）。severity 标签与 `OK` 保持英文作为解析契约，`parseReview` 双语兼容 `> 建议修改:` / `> Suggested fix:` |

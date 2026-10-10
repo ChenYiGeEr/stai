@@ -28,7 +28,9 @@ func StagedDiff() ([]byte, error) {
 
 // StagedDiffDir is StagedDiff for the repository at dir ("" = the current
 // directory). SourceTree custom actions pass the repo path as $REPO, so gen
-// may run from anywhere.
+// may run from anywhere. An empty staging area is NOT an error: callers
+// receive an empty diff with a nil error and must check len(diff) themselves
+// (they surface a localized hint and skip the model call).
 func StagedDiffDir(dir string) ([]byte, error) {
 	args := []string{"diff", "--cached", "--no-ext-diff", "--no-color"}
 	if dir != "" {
@@ -41,9 +43,6 @@ func StagedDiffDir(dir string) ([]byte, error) {
 			return nil, fmt.Errorf("git diff: %s", strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("git diff: %w", err)
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, errors.New("no staged changes — stage files with git add first")
 	}
 	return out, nil
 }
@@ -73,7 +72,9 @@ func BranchDiffDir(dir, baseRef string) ([]byte, error) {
 
 // WorkingTreeDiffDir returns the diff of the working tree against HEAD for
 // the repository at dir ("" = current directory). This includes both staged
-// and unstaged changes, matching what `git stash` would capture.
+// and unstaged changes, matching what `git stash` would capture. A clean
+// working tree is NOT an error: callers receive an empty diff with a nil
+// error and must check len(diff) themselves.
 func WorkingTreeDiffDir(dir string) ([]byte, error) {
 	args := []string{"diff", "HEAD", "--no-ext-diff", "--no-color"}
 	if dir != "" {
@@ -86,9 +87,6 @@ func WorkingTreeDiffDir(dir string) ([]byte, error) {
 			return nil, fmt.Errorf("git diff: %s", strings.TrimSpace(string(ee.Stderr)))
 		}
 		return nil, fmt.Errorf("git diff: %w", err)
-	}
-	if len(bytes.TrimSpace(out)) == 0 {
-		return nil, errors.New("no working tree changes — nothing to stash")
 	}
 	return out, nil
 }

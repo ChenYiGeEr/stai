@@ -11,6 +11,9 @@ func TestLoadFileParsesSubset(t *testing.T) {
 	path := filepath.Join(dir, "config.toml")
 	content := `
 # global settings
+[global]
+lang = "en"
+
 [provider]
 base_url = "http://192.168.1.10:1234/v1"
 api_key  = 'sk-test'
@@ -18,7 +21,6 @@ model    = "deepseek-coder"
 
 [commit]
 style    = "free"
-language = "en"
 
 [review]
 strict = true
@@ -31,12 +33,15 @@ strict = true
 	if err := loadFile(&cfg, path); err != nil {
 		t.Fatal(err)
 	}
+	if cfg.Global.Lang != "en" {
+		t.Errorf("global.lang not parsed: %+v", cfg.Global)
+	}
 	if cfg.Provider.BaseURL != "http://192.168.1.10:1234/v1" ||
 		cfg.Provider.APIKey != "sk-test" ||
 		cfg.Provider.Model != "deepseek-coder" {
 		t.Errorf("provider not parsed: %+v", cfg.Provider)
 	}
-	if cfg.Commit.Style != "free" || cfg.Commit.Language != "en" {
+	if cfg.Commit.Style != "free" {
 		t.Errorf("commit not parsed: %+v", cfg.Commit)
 	}
 	if !cfg.Review.Strict {
@@ -268,10 +273,14 @@ func TestValidateRejectsUnsupportedStyle(t *testing.T) {
 func TestEnvOverrides(t *testing.T) {
 	t.Setenv("STAI_BASE_URL", "http://example:9999/v1")
 	t.Setenv("STAI_MODEL", "env-model")
+	t.Setenv("STAI_LANG", "en")
 	cfg := Default()
 	applyEnv(&cfg)
 	if cfg.Provider.BaseURL != "http://example:9999/v1" || cfg.Provider.Model != "env-model" {
 		t.Errorf("env not applied: %+v", cfg.Provider)
+	}
+	if cfg.Global.Lang != "en" {
+		t.Errorf("STAI_LANG not applied: %+v", cfg.Global)
 	}
 }
 

@@ -21,9 +21,48 @@ import (
 	"stai/internal/ai"
 	"stai/internal/config"
 	"stai/internal/git"
+	"stai/internal/i18n"
 )
 
+// loadConfig loads the layered config, wires the output language into both
+// the CLI text (i18n) and the AI prompts (ai), and sets the log path.
+// Every command uses this instead of calling config.Load directly.
+func loadConfig() config.Config {
+	cfg, err := config.Load()
+	fatal(err)
+	setLangFromConfig(cfg)
+	if _, ok := i18n.Normalize(cfg.Global.Lang); !ok {
+		// Warn after the language switch so the message renders in the
+		// active language (for invalid values that is the zh-CN fallback).
+		fmt.Fprintf(os.Stderr, i18n.T("lang_fallback")+"\n", cfg.Global.Lang)
+	}
+	logPath = cfg.Log.Path
+	return cfg
+}
+
+// setLangFromConfig wires the (already loaded) config language into the i18n
+// and ai packages, silently falling back to zh-CN. Silent because hooks use
+// it and must never block or nag — the CLI path warns via loadConfig.
+func setLangFromConfig(cfg config.Config) {
+	lang, _ := i18n.Normalize(cfg.Global.Lang)
+	i18n.SetLang(lang)
+	ai.SetLang(lang)
+}
+
+// initLang wires the configured language before command dispatch, so even
+// usage/error text on paths that never load the config (no args, unknown
+// command) honors [global] lang and STAI_LANG. Silent: commands that do
+// load the config warn there via loadConfig.
+func initLang() {
+	cfg, err := config.Load()
+	if err != nil {
+		return // broken config: stay on the zh-CN default
+	}
+	setLangFromConfig(cfg)
+}
+
 func main() {
+	initLang()
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -60,51 +99,14 @@ func main() {
 	case "help", "-h", "--help":
 		usage()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown command: %s\n\n", cmd)
+		fmt.Fprintf(os.Stderr, i18n.T("unknown_command")+"\n\n", cmd)
 		usage()
 		os.Exit(2)
 	}
 }
 
 func usage() {
-	fmt.Fprint(os.Stderr, `stai - AI companion for SourceTree git workflows
-
-Usage:
-  stai <command> [flags]
-
-Commands:
-  gen          Generate a commit message from staged changes and copy it
-               to the clipboard (M1)
-  hook         Entrypoint for git hooks:
-               stai hook prepare-commit-msg <msg-file> [source]
-               stai hook pre-commit
-               stai hook pre-push
-  pr           Generate a PR description from the branch diff and copy it
-               to the clipboard (M3-A)
-  pr-title     Generate a one-line PR title from the branch diff and copy
-               it to the clipboard (M3-C)
-  review       AI review of the staged changes (M2). Advisory by default;
-               -strict exits non-zero on high-severity findings.
-               Optional positional argument: the repository path.
-  review-branch AI review of the current branch against its base ref (M3-B).
-               Advisory by default; -strict exits non-zero.
-  stash-msg    Generate a stash message from working-tree changes and copy
-               it to the clipboard (M3-C)
-  explain      Explain the selected file (M3-C). Accepts -file=$FILE (the
-               SourceTree custom-action form) or a positional path.
-  split        Suggest how to split the staged diff into logical commits
-               (M3-C)
-  changelog    Generate release notes from git log since the last tag or a
-               given ref (M3-C)
-  mergetool    Resolve conflicts with per-hunk AI suggestions (M3)
-  install      Write the git hooks and register the SourceTree custom actions
-  uninstall    Remove everything install wrote (stai-owned hooks and
-               custom actions only)
-
-Config: ~/.config/stai/config.toml + per-repo .stai.toml
-Env overrides: STAI_BASE_URL, STAI_API_KEY, STAI_MODEL
-Disable hooks without uninstalling: STAI_DISABLE=1
-`)
+	fmt.Fprint(os.Stderr, i18n.T("usage"))
 }
 
 // cmdGen implements "stai gen": generate a commit message for the staged
@@ -120,9 +122,7 @@ func cmdGen(args []string) {
 	editFlag := fs.Bool("edit", false, "show the message in an editable dialog before copying")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 	logf("gen start args=%q model=%s base_url=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL)
 
 	// SourceTree custom actions append $REPO (the repository path) to the
@@ -132,11 +132,16 @@ func cmdGen(args []string) {
 		repoDir = fs.Arg(0)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
+	if len(bytes.TrimSpace(diff)) == 0 {
+		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("staged_empty"))
+		os.Exit(1)
+	}
 
 	msg, err := generate(context.Background(), cfg, diff)
 	fatal(err)
@@ -153,12 +158,12 @@ func cmdGen(args []string) {
 	logf("gen repo=%s message=%q", repoDir, msg)
 	if err := writeClipboard(msg); err != nil {
 		logf("gen clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
 	notifyCopied(cfg.Notify, msg)
 	logClipboard("exit", msg)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(msg)
 }
 
@@ -184,6 +189,7 @@ func hookPrePush() {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	setLangFromConfig(cfg)
 	logPath = cfg.Log.Path
 	logf("hook pre-push start strict=%v base=%s", cfg.PrePush.Strict, cfg.PrePush.BaseRef)
 	if !cfg.PrePush.Strict {
@@ -206,12 +212,12 @@ func hookPrePush() {
 	findings, err := generateReview(ctx, cfg, diff)
 	if err != nil {
 		logf("hook pre-push: %v (passing)", err)
-		fmt.Fprintf(os.Stderr, "stai: branch review failed, pushing as-is: %v\n", err)
+		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_push")+"\n", err)
 		return
 	}
 	logf("hook pre-push done findings=%d high=%v", len(findings), ai.HasHigh(findings))
 	if ai.HasHigh(findings) {
-		fmt.Fprintln(os.Stderr, "stai: pre-push 审查发现高危问题,push 已阻断(绕过:STAI_DISABLE=1 或 git push --no-verify):")
+		fmt.Fprintln(os.Stderr, i18n.T("review_blocked_push"))
 		fmt.Fprint(os.Stderr, renderFindings(findings, true, true))
 		os.Exit(1)
 	}
@@ -231,15 +237,14 @@ func cmdPR(args []string) {
 	fs := flag.NewFlagSet("pr", flag.ExitOnError)
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	repoDir := ""
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
@@ -250,7 +255,7 @@ func cmdPR(args []string) {
 	diff, err := git.BranchDiffDir(repoDir, baseRef)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintf(os.Stderr, "stai: 当前分支没有领先 %s 的提交\n", baseRef)
+		fmt.Fprintf(os.Stderr, i18n.T("ahead_none")+"\n", baseRef)
 		return
 	}
 
@@ -261,19 +266,22 @@ func cmdPR(args []string) {
 
 	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
-	desc, err := client.GeneratePR(ctx, cfg.Commit, diff)
+	title, desc, err := client.GeneratePR(ctx, cfg.Commit, diff)
 	fatal(err)
 
-	logf("pr repo=%s base=%s", repoDir, baseRef)
-	if err := writeClipboard(desc); err != nil {
+	// F1 delivery: the clipboard holds the combined block (title line, blank
+	// line, description); the notification subtitle carries the title.
+	combined := title + "\n\n" + desc
+	logf("pr repo=%s base=%s title=%q", repoDir, baseRef, title)
+	if err := writeClipboard(combined); err != nil {
 		logf("pr clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "PR 描述已复制到剪贴板", desc)
-	logClipboard("exit", desc)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
-	fmt.Println(desc)
+	notify(cfg.Notify.Title, title, desc)
+	logClipboard("exit", combined)
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
+	fmt.Println(combined)
 }
 
 // cmdPRTitle implements "stai pr-title": generate a one-line PR title for
@@ -282,19 +290,18 @@ func cmdPRTitle(args []string) {
 	fs := flag.NewFlagSet("pr-title", flag.ExitOnError)
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	repoDir := ""
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
 	if fs.NArg() > 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai pr-title [repo]")
+		fmt.Fprintln(os.Stderr, i18n.T("usage_pr_title"))
 		os.Exit(2)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
@@ -305,7 +312,7 @@ func cmdPRTitle(args []string) {
 	diff, err := git.BranchDiffDir(repoDir, baseRef)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintf(os.Stderr, "stai: 当前分支没有领先 %s 的提交\n", baseRef)
+		fmt.Fprintf(os.Stderr, i18n.T("ahead_none")+"\n", baseRef)
 		return
 	}
 
@@ -322,12 +329,12 @@ func cmdPRTitle(args []string) {
 	logf("pr-title repo=%s base=%s title=%q", repoDir, baseRef, title)
 	if err := writeClipboard(title); err != nil {
 		logf("pr-title clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "PR 标题已复制到剪贴板", title)
+	notify(cfg.Notify.Title, i18n.T("notify_pr_title"), title)
 	logClipboard("exit", title)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(title)
 }
 
@@ -340,15 +347,14 @@ func cmdReviewBranch(args []string) {
 	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	repoDir := ""
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
@@ -360,7 +366,7 @@ func cmdReviewBranch(args []string) {
 	diff, err := git.BranchDiffDir(repoDir, baseRef)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintf(os.Stderr, "stai: 当前分支没有领先 %s 的提交\n", baseRef)
+		fmt.Fprintf(os.Stderr, i18n.T("ahead_none")+"\n", baseRef)
 		return
 	}
 
@@ -379,11 +385,11 @@ func cmdReviewBranch(args []string) {
 	// Notifications must stay plain-text (no ANSI) and concise (no fixes).
 	plainReport := renderFindings(findings, false, false)
 	notifBody := plainReport
-	subtitle := "分支审查完成"
+	subtitle := i18n.T("review_subtitle_done")
 	if len(findings) > cfg.Review.NotifyMaxFindings {
 		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
-			notifBody = fmt.Sprintf("问题较多,完整报告已写入 %s\n\n%s", path, severitySummary(findings))
-			subtitle = "分支审查完成,报告已写入文件"
+			notifBody = fmt.Sprintf(i18n.T("review_report_notice"), path, severitySummary(findings))
+			subtitle = i18n.T("review_subtitle_file")
 		} else {
 			logf("review-branch report file write failed: %v", werr)
 			notifBody = severitySummary(findings)
@@ -403,15 +409,14 @@ func cmdStashMsg(args []string) {
 	fs := flag.NewFlagSet("stash-msg", flag.ExitOnError)
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	repoDir := ""
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
@@ -421,8 +426,8 @@ func cmdStashMsg(args []string) {
 	diff, err := git.WorkingTreeDiffDir(repoDir)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintln(os.Stderr, "stai: 工作树没有改动")
-		return
+		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("worktree_empty"))
+		os.Exit(1)
 	}
 
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
@@ -437,12 +442,12 @@ func cmdStashMsg(args []string) {
 	logf("stash-msg repo=%s message=%q", repoDir, msg)
 	if err := writeClipboard(msg); err != nil {
 		logf("stash-msg clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "stash 信息已复制到剪贴板", msg)
+	notify(cfg.Notify.Title, i18n.T("notify_stash"), msg)
 	logClipboard("exit", msg)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(msg)
 }
 
@@ -461,7 +466,7 @@ func cmdExplain(args []string) {
 		filePath = fs.Arg(0)
 	}
 	if filePath == "" {
-		fmt.Fprintln(os.Stderr, "stai: 请先在文件列表中选中一个文件")
+		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("select_file_first"))
 		os.Exit(2)
 	}
 	repoDir := *repoFlag
@@ -483,9 +488,7 @@ func cmdExplain(args []string) {
 		filePath = filepath.Join(repoDir, filePath)
 	}
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	logf("explain start file=%q repo=%q model=%s", filePath, repoDir, cfg.Provider.Model)
 
@@ -496,7 +499,7 @@ func cmdExplain(args []string) {
 	content, err := os.ReadFile(filePath)
 	fatal(err)
 	if len(bytes.TrimSpace(content)) == 0 {
-		fmt.Fprintf(os.Stderr, "stai: 文件为空: %s\n", filePath)
+		fmt.Fprintf(os.Stderr, i18n.T("file_empty")+"\n", filePath)
 		return
 	}
 
@@ -512,12 +515,12 @@ func cmdExplain(args []string) {
 	logf("explain file=%q repo=%q", filePath, repoDir)
 	if err := writeClipboard(explanation); err != nil {
 		logf("explain clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "文件说明已复制到剪贴板", filePath)
+	notify(cfg.Notify.Title, i18n.T("notify_explain"), filePath)
 	logClipboard("exit", explanation)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(explanation)
 }
 
@@ -533,24 +536,22 @@ func cmdSplit(args []string) {
 		repoDir = fs.Arg(0)
 	}
 	if fs.NArg() > 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai split [repo]")
+		fmt.Fprintln(os.Stderr, i18n.T("usage_split"))
 		os.Exit(2)
 	}
 	if repoDir == "" {
 		repoDir = "."
 	}
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	logf("split start args=%q repo=%q model=%s", args, repoDir, cfg.Provider.Model)
 
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintln(os.Stderr, "stai: 暂存区没有改动")
-		return
+		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("staged_empty"))
+		os.Exit(1)
 	}
 
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
@@ -565,12 +566,12 @@ func cmdSplit(args []string) {
 	logf("split repo=%s", repoDir)
 	if err := writeClipboard(suggestion); err != nil {
 		logf("split clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "commit 拆分建议已复制到剪贴板", "")
+	notify(cfg.Notify.Title, i18n.T("notify_split"), "")
 	logClipboard("exit", suggestion)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(suggestion)
 }
 
@@ -583,16 +584,14 @@ func cmdChangelog(args []string) {
 
 	repoDir := *repoFlag
 	if fs.NArg() > 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai changelog [since]")
+		fmt.Fprintln(os.Stderr, i18n.T("usage_changelog"))
 		os.Exit(2)
 	}
 	if repoDir == "" {
 		repoDir = "."
 	}
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	since := ""
 	if fs.NArg() > 0 {
@@ -601,7 +600,7 @@ func cmdChangelog(args []string) {
 	if since == "" {
 		tag, err := git.LastTagDir(repoDir)
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "stai: 未指定起始标签且无法获取最近标签: %v\n", err)
+			fmt.Fprintf(os.Stderr, i18n.T("no_tag")+"\n", err)
 			os.Exit(2)
 		}
 		since = tag
@@ -612,7 +611,7 @@ func cmdChangelog(args []string) {
 	logOut, err := git.LogRangeDir(since, "HEAD", repoDir)
 	fatal(err)
 	if len(bytes.TrimSpace(logOut)) == 0 {
-		fmt.Fprintf(os.Stderr, "stai: %s..HEAD 没有提交\n", since)
+		fmt.Fprintf(os.Stderr, i18n.T("log_empty")+"\n", since)
 		return
 	}
 	input := fmt.Sprintf("范围: %s..HEAD\n\n提交历史:\n%s", since, string(logOut))
@@ -629,12 +628,12 @@ func cmdChangelog(args []string) {
 	logf("changelog since=%q", since)
 	if err := writeClipboard(notes); err != nil {
 		logf("changelog clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: clipboard copy failed: %v\n", err)
+		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
 		return
 	}
-	notify(cfg.Notify.Title, "changelog 已复制到剪贴板", since)
+	notify(cfg.Notify.Title, i18n.T("notify_changelog"), since)
 	logClipboard("exit", notes)
-	fmt.Fprintln(os.Stderr, "copied to clipboard")
+	fmt.Fprintln(os.Stderr, i18n.T("copied"))
 	fmt.Println(notes)
 }
 
@@ -642,9 +641,10 @@ func cmdChangelog(args []string) {
 // returns the edited text, or ok=false when the user cancels or the dialog
 // fails (never block the workflow because of a UI hiccup).
 func dialogEdit(msg string) (edited string, ok bool) {
-	script := `on run argv
-	return text returned of (display dialog "可编辑,确定后复制到剪贴板,再到 SourceTree 提交框粘贴" default answer (item 1 of argv) buttons {"取消", "确定"} default button "确定" cancel button "取消" with title "stai — 编辑提交信息")
-end run`
+	cancel, okBtn := i18n.T("dialog_cancel"), i18n.T("dialog_ok")
+	script := fmt.Sprintf(`on run argv
+	return text returned of (display dialog %q default answer (item 1 of argv) buttons {%q, %q} default button %q cancel button %q with title %q)
+end run`, i18n.T("dialog_edit_body"), cancel, okBtn, okBtn, cancel, i18n.T("dialog_edit_title"))
 	cmd := utf8Cmd("osascript", "-e", script, "--", msg)
 	out, err := cmd.Output()
 	if err != nil {
@@ -661,7 +661,7 @@ func cmdHook(args []string) {
 	fs := flag.NewFlagSet("hook", flag.ExitOnError)
 	fs.Parse(args)
 	if fs.NArg() < 1 {
-		fmt.Fprintln(os.Stderr, "usage: stai hook <prepare-commit-msg <msg-file> [source] | pre-commit | pre-push>")
+		fmt.Fprintln(os.Stderr, i18n.T("usage_hook"))
 		os.Exit(2)
 	}
 	switch fs.Arg(0) {
@@ -672,7 +672,7 @@ func cmdHook(args []string) {
 	case "pre-push":
 		hookPrePush()
 	default:
-		fmt.Fprintf(os.Stderr, "unknown hook: %s\n", fs.Arg(0))
+		fmt.Fprintf(os.Stderr, i18n.T("unknown_hook")+"\n", fs.Arg(0))
 		os.Exit(2)
 	}
 }
@@ -701,6 +701,7 @@ func hookPrepareCommitMsg(msgFile, source string) {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	setLangFromConfig(cfg)
 	logPath = cfg.Log.Path
 	logf("hook prepare-commit-msg start (message empty)")
 
@@ -710,13 +711,17 @@ func hookPrepareCommitMsg(msgFile, source string) {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	if len(bytes.TrimSpace(diff)) == 0 {
+		logf("hook prepare-commit-msg: nothing staged, skipping")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
 	msg, err := generate(ctx, cfg, diff)
 	if err != nil {
 		logf("hook prepare-commit-msg: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: commit message generation failed, committing as-is: %v\n", err)
+		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("hook_msg_gen_failed")+"\n", err)
 		return
 	}
 	logf("hook prepare-commit-msg message=%q", msg)
@@ -741,6 +746,7 @@ func hookPreCommit() {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	setLangFromConfig(cfg)
 	logPath = cfg.Log.Path
 	logf("hook pre-commit start strict=%v", cfg.Review.Strict)
 	if !cfg.Review.Strict {
@@ -753,18 +759,22 @@ func hookPreCommit() {
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
 		return
 	}
+	if len(bytes.TrimSpace(diff)) == 0 {
+		logf("hook pre-commit: nothing staged, passing")
+		return
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
 	findings, err := generateReview(ctx, cfg, diff)
 	if err != nil {
 		logf("hook pre-commit: %v (passing)", err)
-		fmt.Fprintf(os.Stderr, "stai: review failed, committing as-is: %v\n", err)
+		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_commit")+"\n", err)
 		return
 	}
 	logf("hook pre-commit done findings=%d high=%v", len(findings), ai.HasHigh(findings))
 	if ai.HasHigh(findings) {
-		fmt.Fprintln(os.Stderr, "stai: pre-commit 审查发现高危问题,提交已阻断(绕过:STAI_DISABLE=1 或 git commit --no-verify):")
+		fmt.Fprintln(os.Stderr, i18n.T("review_blocked_commit"))
 		fmt.Fprint(os.Stderr, renderFindings(findings, true, true))
 		os.Exit(1)
 	}
@@ -779,8 +789,7 @@ func cmdInstall(args []string) {
 	noSourceTree := fs.Bool("no-sourcetree", false, "skip registering the SourceTree custom actions")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
+	cfg := loadConfig()
 	exe, err := os.Executable()
 	fatal(err)
 	exe, err = filepathEvalSymlinks(exe)
@@ -826,59 +835,27 @@ exit 0
 		if err := os.WriteFile(path, []byte(h.body), 0o755); err != nil {
 			fatal(fmt.Errorf("writing hook: %w", err))
 		}
-		fmt.Printf("hook installed: %s\n", path)
+		fmt.Printf(i18n.T("install_hook_installed")+"\n", path)
 	}
 
 	if *noSourceTree {
 		return
 	}
 	if err := installSourceTreeActions(exe, cfg.SourceTree); err != nil {
-		fmt.Fprintf(os.Stderr, `SourceTree custom actions not registered: %v
-
-Add them manually: SourceTree → Settings → Custom Actions → Add:
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    gen $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    review -no-color $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    pr $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    pr-title $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    review-branch -no-color $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    stash-msg $REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    explain -file=$FILE -repo=$REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    split -repo=$REPO
-  Menu caption:  %s
-  Script to run:  %s
-  Parameters:    changelog -repo=$REPO
-`, err, cfg.SourceTree.ActionCaption, exe, cfg.SourceTree.ReviewActionCaption, exe,
-			cfg.SourceTree.PRActionCaption, exe,
-			cfg.SourceTree.PRTitleActionCaption, exe,
-			cfg.SourceTree.ReviewBranchActionCaption, exe,
-			cfg.SourceTree.StashMsgActionCaption, exe,
-			cfg.SourceTree.ExplainActionCaption, exe,
-			cfg.SourceTree.SplitActionCaption, exe,
-			cfg.SourceTree.ChangelogActionCaption, exe)
+		fmt.Fprintf(os.Stderr, i18n.T("install_actions_failed"), err)
+		fmt.Fprintln(os.Stderr, i18n.T("install_add_manually"))
+		for _, a := range sourceTreeActions(cfg.SourceTree) {
+			fmt.Fprintf(os.Stderr, i18n.T("install_caption")+"\n", a.Caption)
+			fmt.Fprintf(os.Stderr, i18n.T("install_script")+"\n", exe)
+			fmt.Fprintf(os.Stderr, i18n.T("install_params")+"\n", a.Params)
+		}
 		return
 	}
-	fmt.Printf("SourceTree custom actions registered: %s, %s, %s, %s, %s, %s, %s, %s, %s (restart SourceTree)\n",
-		cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption,
-		cfg.SourceTree.PRActionCaption, cfg.SourceTree.PRTitleActionCaption,
-		cfg.SourceTree.ReviewBranchActionCaption, cfg.SourceTree.StashMsgActionCaption,
-		cfg.SourceTree.ExplainActionCaption, cfg.SourceTree.SplitActionCaption,
-		cfg.SourceTree.ChangelogActionCaption)
+	captions := make([]string, 0, len(sourceTreeActions(cfg.SourceTree)))
+	for _, a := range sourceTreeActions(cfg.SourceTree) {
+		captions = append(captions, a.Caption)
+	}
+	fmt.Printf(i18n.T("install_registered")+"\n", strings.Join(captions, ", "))
 }
 
 // cmdUninstall removes everything install wrote: hooks that carry the
@@ -890,8 +867,7 @@ func cmdUninstall(args []string) {
 	noSourceTree := fs.Bool("no-sourcetree", false, "skip removing the SourceTree custom actions")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
+	cfg := loadConfig()
 	exe, err := os.Executable()
 	fatal(err)
 	exe, err = filepathEvalSymlinks(exe)
@@ -912,14 +888,14 @@ func cmdUninstall(args []string) {
 			continue
 		}
 		if !strings.Contains(string(data), "installed by stai") {
-			fmt.Printf("hook left alone (not written by stai): %s\n", path)
+			fmt.Printf(i18n.T("install_hook_left_alone")+"\n", path)
 			continue
 		}
 		if err := os.Remove(path); err != nil {
-			fmt.Fprintf(os.Stderr, "stai: removing hook: %v\n", err)
+			fmt.Fprintf(os.Stderr, "stai: "+i18n.T("install_removing_failed")+"\n", err)
 			continue
 		}
-		fmt.Printf("hook removed: %s\n", path)
+		fmt.Printf(i18n.T("install_hook_removed")+"\n", path)
 	}
 
 	if *noSourceTree {
@@ -927,20 +903,14 @@ func cmdUninstall(args []string) {
 	}
 	removed, err := uninstallSourceTreeActions(exe, cfg.SourceTree)
 	if err != nil {
-		fmt.Fprintf(os.Stderr, `SourceTree custom actions not removed: %v
-
-Remove them manually: SourceTree → Settings → Custom Actions:
-  %s
-  %s
-  %s
-  %s
-  %s
-`, err, cfg.SourceTree.ActionCaption, cfg.SourceTree.ReviewActionCaption,
-			cfg.SourceTree.PRActionCaption, cfg.SourceTree.ReviewBranchActionCaption,
-			cfg.SourceTree.StashMsgActionCaption)
+		fmt.Fprintf(os.Stderr, i18n.T("install_remove_failed"), err)
+		fmt.Fprintln(os.Stderr, i18n.T("install_remove_manually"))
+		for _, a := range sourceTreeActions(cfg.SourceTree) {
+			fmt.Fprintf(os.Stderr, "  %s\n", a.Caption)
+		}
 		return
 	}
-	fmt.Printf("SourceTree custom actions removed: %d (restart SourceTree)\n", removed)
+	fmt.Printf(i18n.T("install_removed")+"\n", removed)
 }
 
 // staiAction is one SourceTree custom action entry to register.
@@ -953,16 +923,10 @@ type staiAction struct {
 	ShowFullOutput bool   `json:"showFullOutput"`
 }
 
-// installSourceTreeActions registers the custom actions in SourceTree's real
-// action storage: ~/Library/Application Support/SourceTree/actions.plist,
-// an NSKeyedArchiver plist of mutable dictionaries. The schema was
-// captured from a Sourcetree 4.2.19-generated entry (verified at runtime:
-// adding an action in the UI rewrites exactly this file). The defaults
-// "customActions" key is a legacy migration path and no longer feeds the
-// UI. Read-modify-write runs in one JXA script so a crash midway cannot
-// corrupt the file; entries owned by other tools are preserved.
-func installSourceTreeActions(exe string, st config.SourceTree) error {
-	data, err := json.Marshal([]staiAction{
+// sourceTreeActions is the single definition of the nine custom actions,
+// shared by the JXA installer and the manual-fallback printout.
+func sourceTreeActions(st config.SourceTree) []staiAction {
+	return []staiAction{
 		{st.ReviewActionCaption, "review -no-color $REPO", st.ReviewShortcutKeyCode, st.ReviewShortcutModifiers, st.ReviewShortcutDisplay, true},
 		{st.ActionCaption, "gen $REPO", st.ShortcutKeyCode, st.ShortcutModifiers, st.ShortcutDisplay, false},
 		{st.PRActionCaption, "pr $REPO", st.PRShortcutKeyCode, st.PRShortcutModifiers, st.PRShortcutDisplay, false},
@@ -972,7 +936,19 @@ func installSourceTreeActions(exe string, st config.SourceTree) error {
 		{st.ExplainActionCaption, "explain -file=$FILE -repo=$REPO", 0, 0, "", true},
 		{st.SplitActionCaption, "split -repo=$REPO", 0, 0, "", false},
 		{st.ChangelogActionCaption, "changelog -repo=$REPO", 0, 0, "", false},
-	})
+	}
+}
+
+// installSourceTreeActions registers the custom actions in SourceTree's real
+// action storage: ~/Library/Application Support/SourceTree/actions.plist,
+// an NSKeyedArchiver plist of mutable dictionaries. The schema was
+// captured from a Sourcetree 4.2.19-generated entry (verified at runtime:
+// adding an action in the UI rewrites exactly this file). The defaults
+// "customActions" key is a legacy migration path and no longer feeds the
+// UI. Read-modify-write runs in one JXA script so a crash midway cannot
+// corrupt the file; entries owned by other tools are preserved.
+func installSourceTreeActions(exe string, st config.SourceTree) error {
+	data, err := json.Marshal(sourceTreeActions(st))
 	if err != nil {
 		return err
 	}
@@ -1174,9 +1150,14 @@ end run`
 
 // notifyCopied surfaces the generated message in a macOS notification —
 // SourceTree custom actions swallow stdout, so without it the user would
-// see nothing before pasting.
+// see nothing before pasting. An empty configured subtitle falls back to the
+// language-dependent default.
 func notifyCopied(n config.Notify, msg string) {
-	notify(n.Title, n.Subtitle, msg)
+	subtitle := n.Subtitle
+	if subtitle == "" {
+		subtitle = i18n.T("notify_subtitle")
+	}
+	notify(n.Title, subtitle, msg)
 }
 
 // resolveRealPath returns the absolute, symlink-free form of p. Symlink
@@ -1236,15 +1217,14 @@ func cmdReview(args []string) {
 	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
 	fs.Parse(args)
 
-	cfg, err := config.Load()
-	fatal(err)
-	logPath = cfg.Log.Path
+	cfg := loadConfig()
 
 	repoDir := ""
 	if fs.NArg() > 0 {
 		repoDir = fs.Arg(0)
 	}
 	if repoDir == "" {
+		var err error
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
@@ -1253,6 +1233,10 @@ func cmdReview(args []string) {
 
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
+	if len(bytes.TrimSpace(diff)) == 0 {
+		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("staged_empty"))
+		os.Exit(2)
+	}
 
 	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
@@ -1272,11 +1256,11 @@ func cmdReview(args []string) {
 	// concise (no fixes).
 	plainReport := renderFindings(findings, false, false)
 	notifBody := plainReport
-	subtitle := "审查完成"
+	subtitle := i18n.T("review_subtitle_done")
 	if len(findings) > cfg.Review.NotifyMaxFindings {
 		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
-			notifBody = fmt.Sprintf("问题较多,完整报告已写入 %s\n\n%s", path, severitySummary(findings))
-			subtitle = "审查完成,报告已写入文件"
+			notifBody = fmt.Sprintf(i18n.T("review_report_notice"), path, severitySummary(findings))
+			subtitle = i18n.T("review_subtitle_file")
 		} else {
 			logf("review report file write failed: %v", werr)
 			notifBody = severitySummary(findings)
@@ -1345,7 +1329,7 @@ const colorReset = "\033[0m"
 // SuggestedFix lines are printed (yes for stdout/report, no for notifications).
 func renderFindings(findings []ai.Finding, color, includeFixes bool) string {
 	if len(findings) == 0 {
-		return "OK 未发现问题\n"
+		return i18n.T("review_ok") + "\n"
 	}
 	var b strings.Builder
 	for _, f := range findings {
@@ -1367,7 +1351,7 @@ func renderFindings(findings []ai.Finding, color, includeFixes bool) string {
 			fmt.Fprintf(&b, "%s %s\n", prefix, f.Message)
 		}
 		if includeFixes && f.SuggestedFix != "" {
-			fmt.Fprintf(&b, "  > 建议修改: %s\n", f.SuggestedFix)
+			fmt.Fprintf(&b, "  %s%s\n", i18n.T("review_fix_label"), f.SuggestedFix)
 		}
 	}
 	return b.String()
@@ -1388,7 +1372,7 @@ func severitySummary(findings []ai.Finding) string {
 			other++
 		}
 	}
-	return fmt.Sprintf("high %d,medium %d,low %d,未归类 %d", high, medium, low, other)
+	return fmt.Sprintf(i18n.T("review_summary"), high, medium, low, other)
 }
 
 // writeReportFile saves the full report under the repo (default
@@ -1403,7 +1387,7 @@ func writeReportFile(cfg config.Config, repoDir string, findings []ai.Finding) (
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return "", err
 	}
-	content := fmt.Sprintf("# stai 审查报告\n\n%s\n%s\n",
+	content := fmt.Sprintf(i18n.T("review_report_title")+"%s\n%s\n",
 		time.Now().Format("2006-01-02 15:04:05"), renderFindings(findings, false, true))
 	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
 		return "", err
@@ -1419,7 +1403,7 @@ func cmdMergetool(args []string) {
 }
 
 func notImplemented(cmd, plan string) {
-	fmt.Printf("stai %s: not implemented yet\n  plan: %s\n", cmd, plan)
+	fmt.Printf(i18n.T("mergetool_not_impl"), cmd, plan)
 }
 
 func fatal(err error) {

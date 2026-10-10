@@ -15,6 +15,13 @@ import (
 	"stai/internal/git"
 )
 
+// Global holds process-wide settings. Lang drives both the CLI text and the
+// AI output language; it is normalized (strict "zh-CN"/"en", invalid values
+// fall back to zh-CN with a warning) by the caller after Load.
+type Global struct {
+	Lang string // "zh-CN" (default) or "en"
+}
+
 type Provider struct {
 	BaseURL     string
 	APIKey      string
@@ -25,7 +32,6 @@ type Provider struct {
 
 type Commit struct {
 	Style        string   // "conventional" or "free"
-	Language     string   // e.g. "zh-CN"
 	Types        []string // allowed Conventional Commits types
 	SubjectMax   int      // subject length hint (characters) given to the model
 	BodyMinLines int      // a body is requested only when changed lines exceed this
@@ -97,6 +103,7 @@ type Log struct {
 }
 
 type Config struct {
+	Global     Global
 	Provider   Provider
 	Commit     Commit
 	Review     Review
@@ -110,6 +117,7 @@ type Config struct {
 func Default() Config {
 	home, _ := os.UserHomeDir()
 	return Config{
+		Global: Global{Lang: "zh-CN"},
 		Provider: Provider{
 			BaseURL:    "http://localhost:11434/v1", // local Ollama by default
 			APIKey:     "",
@@ -118,7 +126,6 @@ func Default() Config {
 		},
 		Commit: Commit{
 			Style:        "conventional",
-			Language:     "zh-CN",
 			Types:        []string{"feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"},
 			SubjectMax:   50,
 			BodyMinLines: 100,
@@ -142,7 +149,7 @@ func Default() Config {
 		Hook: Hook{TimeoutSec: 120},
 		Notify: Notify{
 			Title:    "stai",
-			Subtitle: "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框",
+			Subtitle: "", // empty = language-dependent default resolved at notify time
 		},
 		SourceTree: SourceTree{
 			ActionCaption:                 "AI 生成提交信息",
@@ -224,6 +231,9 @@ func (cfg Config) validate() error {
 }
 
 func applyEnv(cfg *Config) {
+	if v := os.Getenv("STAI_LANG"); v != "" {
+		cfg.Global.Lang = v
+	}
 	if v := os.Getenv("STAI_BASE_URL"); v != "" {
 		cfg.Provider.BaseURL = v
 	}
@@ -294,6 +304,8 @@ func stripComment(s string) string {
 func set(cfg *Config, section, key, raw string) error {
 	var err error
 	switch section + "." + key {
+	case "global.lang":
+		err = setString(raw, &cfg.Global.Lang)
 	case "provider.base_url":
 		err = setString(raw, &cfg.Provider.BaseURL)
 	case "provider.api_key":
@@ -306,8 +318,6 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setFloat(raw, &cfg.Provider.Temperature)
 	case "commit.style":
 		err = setString(raw, &cfg.Commit.Style)
-	case "commit.language":
-		err = setString(raw, &cfg.Commit.Language)
 	case "commit.types":
 		err = setStrings(raw, &cfg.Commit.Types)
 	case "commit.subject_max":

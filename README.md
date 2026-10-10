@@ -1,7 +1,14 @@
 # stai — SourceTree 的 AI 伴侣工具
 
+[English](README.en.md) | 中文
+
 stai 是一个独立的命令行工具，通过 Git 标准机制（钩子、自定义操作）接入 SourceTree 的工作流，
 不是 SourceTree 插件（SourceTree 没有插件机制，原因见 [docs/design.md](docs/design.md)）。
+
+## 界面语言
+
+CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查报告等）的语言由 `[global] lang` 控制，
+默认为 `zh-CN`（中文）；设为 `en` 则全部切换为英文。环境变量 `STAI_LANG` 可临时覆盖。
 
 提供四类能力：
 
@@ -130,10 +137,10 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 执行 **动作 → 自定义操作 → AI 生成 PR 描述**（或按 ⌥P）：
 
 - 读取当前分支相对于 `pre_push.base_ref`（默认 `origin/main`）的 diff；
-- 生成标准 markdown 三段式 PR 描述（标题 / 摘要 / 主要改动），复制到剪贴板；
-- 系统通知展示全文，贴到 GitHub/GitLab PR 正文即可。
+- **一次模型调用**同时产出 PR 标题与描述：剪贴板放入"标题行 + 空行 + 描述正文"整块（正文含 `## 摘要`、`## 主要改动` 两节），系统通知副标题即标题行；
+- 标题按 Conventional Commits 校验（不合规自动重试），贴到 GitHub/GitLab 时第一行剪进标题栏、其余粘进正文即可。
 
-等价命令行：`stai pr`。
+等价命令行：`stai pr`。只想要一行标题时用 `stai pr-title`。
 
 #### 分支审查（M3-B）
 
@@ -222,6 +229,9 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 可以直接复制以下示例作为起点：
 
 ```toml
+[global]
+lang = "zh-CN"            # 界面与 AI 输出语言："zh-CN" 或 "en"
+
 [provider]
 base_url        = "http://localhost:11434/v1"
 api_key         = ""
@@ -230,7 +240,6 @@ timeout_seconds = 120
 
 [commit]
 style            = "conventional"
-language         = "zh-CN"
 types            = ["feat", "fix", "refactor", "docs", "chore", "test", "style", "perf", "build", "ci"]
 subject_max      = 50
 body_min_lines   = 100
@@ -259,7 +268,7 @@ strict = false            # true 时 git push 前审查分支 diff，发现 high
 
 [notify]
 title    = "stai"
-subtitle = "提交信息已复制到剪贴板，Cmd+V 粘贴到提交框"
+subtitle = ""  # 留空则随 lang 自动选择中英文默认文案
 
 [sourcetree]
 action_caption            = "AI 生成提交信息"
@@ -279,13 +288,13 @@ path = "~/Library/Logs/stai.log"
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
+| `global.lang` | `zh-CN` | 界面文案、通知与 AI 产出的语言，严格只支持 `zh-CN` 或 `en`；非法值回退 `zh-CN` 并告警一次 |
 | `provider.base_url` | `http://localhost:11434/v1` | OpenAI 兼容接口地址（Ollama、LM Studio、网关均可） |
 | `provider.api_key` | `""` | 接口密钥，本地模型留空 |
 | `provider.model` | `qwen2.5-coder:7b` | 模型名称 |
 | `provider.timeout_seconds` | `120` | 单次模型请求超时（秒） |
 | `provider.temperature` | `0` | 请求 temperature，`0` 为确定性输出；个别模型只接受 `1` |
 | `commit.style` | `conventional` | 目前只支持 `conventional`，其他值会报错 |
-| `commit.language` | `zh-CN` | 提交信息语言，`zh-CN` 或 `en` |
 | `commit.types` | `feat` … `ci`（共 10 种） | 允许的 type；不在列表中的输出会被重试，仍不合规则报错 |
 | `commit.subject_max` | `50` | 概要字数上限（提示给模型） |
 | `commit.body_min_lines` | `100` | 改动行数超过该值时才写 body |
@@ -306,7 +315,7 @@ path = "~/Library/Logs/stai.log"
 | `pre_push.base_ref` | `"origin/main"` | PR 描述、分支 review、pre-push hook 的比较基线 |
 | `pre_push.strict` | `false` | `true` 时 `git push` 前自动审查分支 diff，发现 high 则阻断 push |
 | `notify.title` | `stai` | 系统通知标题 |
-| `notify.subtitle` | `提交信息已复制到剪贴板，Cmd+V 粘贴到提交框` | 生成提交信息的通知副标题 |
+| `notify.subtitle` | `""`（空 = 随 `lang` 自动选择中英文默认文案） | 生成提交信息的通知副标题 |
 | `sourcetree.action_caption` | `AI 生成提交信息` | 生成提交信息动作的菜单名，修改后需重新执行 `stai install` |
 | `sourcetree.shortcut_key_code` | `5` | 快捷键键码，`5` 为 G |
 | `sourcetree.shortcut_modifiers` | `524288` | 修饰键，`524288` 为 Option (⌥) |
@@ -335,6 +344,7 @@ path = "~/Library/Logs/stai.log"
 | `STAI_BASE_URL` | 覆盖 `provider.base_url` |
 | `STAI_API_KEY` | 覆盖 `provider.api_key` |
 | `STAI_MODEL` | 覆盖 `provider.model` |
+| `STAI_LANG` | 覆盖 `global.lang`（`zh-CN` 或 `en`） |
 | `STAI_DISABLE` | 非空时钩子直接放行，不生成信息 |
 
 
@@ -350,9 +360,10 @@ go run ./cmd/stai help         # 查看命令帮助
 
 ```
 cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall）
-internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/PR 标题/stash 信息/文件解释/拆分建议/changelog 生成与提交前/分支审查
+internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/PR 标题/stash 信息/文件解释/拆分建议/changelog 生成与提交前/分支审查（中英双语提示词）
 internal/config  分层配置加载
 internal/git     git 命令封装（暂存区 diff、分支 diff、工作树 diff、git log、标签、钩子路径）
+internal/i18n    CLI 文案中英对照表与语言切换
 docs/            设计说明（design.md）
 ```
 

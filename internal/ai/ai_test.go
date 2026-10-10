@@ -16,11 +16,18 @@ import (
 	"stai/internal/config"
 )
 
-// testCommit returns the default commit rules with the given language.
-func testCommit(lang string) config.Commit {
-	c := config.Default().Commit
-	c.Language = lang
-	return c
+// testCommit returns the default commit rules.
+func testCommit() config.Commit {
+	return config.Default().Commit
+}
+
+// setLang switches the package output language for the duration of one
+// test (or subtest), restoring the previous language on cleanup.
+func setLang(t *testing.T, l string) {
+	t.Helper()
+	prev := lang
+	SetLang(l)
+	t.Cleanup(func() { SetLang(prev) })
 }
 
 func reply(content string) chatResponse {
@@ -101,7 +108,7 @@ func TestGenerateCommitCleansFences(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	msg, err := c.GenerateCommit(context.Background(), testCommit("zh-CN"), []byte("diff --git a/x b/x"))
+	msg, err := c.GenerateCommit(context.Background(), testCommit(), []byte("diff --git a/x b/x"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -121,7 +128,8 @@ func TestGenerateCommitTruncates(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	cfg := testCommit("en")
+	setLang(t, "en")
+	cfg := testCommit()
 	cfg.MaxDiffChars = 100
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
 	if _, err := c.GenerateCommit(context.Background(), cfg, []byte(strings.Repeat("x", 1000))); err != nil {
@@ -166,7 +174,8 @@ func TestValidateCommit(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			reason := validateCommit(tc.msg, testCommit(tc.lang))
+			setLang(t, tc.lang)
+			reason := validateCommit(tc.msg, testCommit())
 			if tc.wantReason == "" && reason != "" {
 				t.Errorf("unexpected rejection: %s", reason)
 			}
@@ -190,7 +199,7 @@ func TestGenerateCommitRetriesOnInvalid(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	msg, err := c.GenerateCommit(context.Background(), testCommit("zh-CN"), []byte("diff --git a/x b/x\n+line"))
+	msg, err := c.GenerateCommit(context.Background(), testCommit(), []byte("diff --git a/x b/x\n+line"))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -220,8 +229,9 @@ func TestRetryDoesNotResendDiff(t *testing.T) {
 	}))
 	defer srv.Close()
 
+	setLang(t, "en")
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	if _, err := c.GenerateCommit(context.Background(), testCommit("en"), []byte("diff --git a/x b/x\n+UNIQUE_DIFF_MARKER")); err != nil {
+	if _, err := c.GenerateCommit(context.Background(), testCommit(), []byte("diff --git a/x b/x\n+UNIQUE_DIFF_MARKER")); err != nil {
 		t.Fatal(err)
 	}
 	if len(second.Messages) != 4 {
@@ -246,7 +256,7 @@ func TestGenerateCommitRejectsUnknownTypeAfterRetry(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	msg, err := c.GenerateCommit(context.Background(), testCommit("zh-CN"), []byte("diff --git a/x b/x\n+line"))
+	msg, err := c.GenerateCommit(context.Background(), testCommit(), []byte("diff --git a/x b/x\n+line"))
 	if err == nil {
 		t.Fatalf("expected error for a still-invalid type, got message %q", msg)
 	}
@@ -267,7 +277,7 @@ func TestGenerateCommitNoRetryWhenValid(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	if _, err := c.GenerateCommit(context.Background(), testCommit("zh-CN"), []byte("diff --git a/x b/x\n+line")); err != nil {
+	if _, err := c.GenerateCommit(context.Background(), testCommit(), []byte("diff --git a/x b/x\n+line")); err != nil {
 		t.Fatal(err)
 	}
 	if calls != 1 {
@@ -598,8 +608,8 @@ func TestGeneratePRAndStashMsg(t *testing.T) {
 			content = req.Messages[len(req.Messages)-1].Content
 		}
 		reply := "OK"
-		if strings.Contains(content, "PR 描述") {
-			reply = "# 修复登录问题\n\n## 摘要\n\n修复了 token 校验失败的 bug。\n\n## 主要改动\n\n- 增加过期检查\n- 修正错误提示"
+		if strings.Contains(content, "PR 标题(第一行)与描述") {
+			reply = "feat: 修复登录问题\n\n## 摘要\n\n修复了 token 校验失败的 bug。\n\n## 主要改动\n\n- 增加过期检查\n- 修正错误提示"
 		} else if strings.Contains(content, "stash message") {
 			reply = "修复 token 校验"
 		}
@@ -608,14 +618,17 @@ func TestGeneratePRAndStashMsg(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	cfg := config.Commit{Types: []string{"feat"}, Language: "zh-CN"}
+	cfg := config.Commit{Types: []string{"feat"}}
 
-	desc, err := c.GeneratePR(context.Background(), cfg, []byte("diff --git a/login.go"))
+	title, desc, err := c.GeneratePR(context.Background(), cfg, []byte("diff --git a/login.go"))
 	if err != nil {
 		t.Fatalf("GeneratePR: %v", err)
 	}
-	if !strings.Contains(desc, "修复登录问题") {
-		t.Errorf("GeneratePR output = %q", desc)
+	if title != "feat: 修复登录问题" {
+		t.Errorf("GeneratePR title = %q", title)
+	}
+	if !strings.Contains(desc, "修复了 token 校验失败") || !strings.Contains(desc, "## 主要改动") {
+		t.Errorf("GeneratePR body = %q", desc)
 	}
 
 	msg, err := c.GenerateStashMsg(context.Background(), cfg, []byte("diff --git a/login.go"))
@@ -634,7 +647,7 @@ func TestGeneratePRTitle(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	cfg := config.Commit{Types: []string{"feat", "fix"}, Language: "zh-CN"}
+	cfg := config.Commit{Types: []string{"feat", "fix"}}
 	title, err := c.GeneratePRTitle(context.Background(), cfg, []byte("diff --git a/login.go"))
 	if err != nil {
 		t.Fatalf("GeneratePRTitle: %v", err)
@@ -651,7 +664,7 @@ func TestGenerateExplanation(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	cfg := config.Commit{Language: "zh-CN"}
+	cfg := config.Commit{}
 	out, err := c.GenerateExplanation(context.Background(), cfg, "login.go", []byte("package login"))
 	if err != nil {
 		t.Fatalf("GenerateExplanation: %v", err)
@@ -668,7 +681,7 @@ func TestGenerateSplitSuggestion(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	cfg := config.Commit{Types: []string{"feat"}, Language: "zh-CN"}
+	cfg := config.Commit{Types: []string{"feat"}}
 	out, err := c.GenerateSplitSuggestion(context.Background(), cfg, []byte("diff --git a/login.go\ndiff --git a/login_test.go"))
 	if err != nil {
 		t.Fatalf("GenerateSplitSuggestion: %v", err)
@@ -685,7 +698,7 @@ func TestGenerateChangelog(t *testing.T) {
 	defer srv.Close()
 
 	c := NewClient(srv.URL, "", "test-model", time.Minute)
-	cfg := config.Commit{Language: "zh-CN"}
+	cfg := config.Commit{}
 	out, err := c.GenerateChangelog(context.Background(), cfg, "abc123 fix token\ndef456 add test")
 	if err != nil {
 		t.Fatalf("GenerateChangelog: %v", err)
@@ -880,5 +893,106 @@ func TestDiffStatsCountsDashPrefixedContent(t *testing.T) {
 	}
 	if lines != 3 { // "-- old separator", "-// removed comment", "+kept"
 		t.Errorf("changed lines = %d, want 3", lines)
+	}
+}
+
+func TestParseReviewAcceptsEnglishFixPrefix(t *testing.T) {
+	findings, bad := parseReview("[HIGH] a/a.go:1 - nil pointer dereference\n> Suggested fix: add a nil check before use\n[MEDIUM] b/b.go:2 - unchecked error")
+	if len(bad) != 0 {
+		t.Errorf("bad lines: %v", bad)
+	}
+	if len(findings) != 2 {
+		t.Fatalf("got %d findings, want 2", len(findings))
+	}
+	if findings[0].SuggestedFix != "add a nil check before use" {
+		t.Errorf("SuggestedFix = %q", findings[0].SuggestedFix)
+	}
+}
+
+func TestParseReviewAcceptsEnglishNoIssues(t *testing.T) {
+	findings, bad := parseReview("No issues found.")
+	if findings != nil || bad != nil {
+		t.Errorf("expected empty result, got findings=%v bad=%v", findings, bad)
+	}
+}
+
+func TestReviewPromptAssemblyEnglish(t *testing.T) {
+	setLang(t, "en")
+	p := reviewPrompt([]string{"rule one"}, true, true)
+	for _, want := range []string{"Go-specific focus", "rule one", "Suggested fix", "Precision beats recall"} {
+		if !strings.Contains(p, want) {
+			t.Errorf("prompt missing %q:\n%s", want, p)
+		}
+	}
+}
+
+func TestBuildCommitSystemPromptEnglish(t *testing.T) {
+	setLang(t, "en")
+	p := buildCommitSystemPrompt(testCommit())
+	if !strings.Contains(p, "output language must be English") {
+		t.Errorf("English prompt missing language rule:\n%.200s", p)
+	}
+}
+
+func TestSplitPRReply(t *testing.T) {
+	cfg := config.Commit{Types: []string{"feat", "fix"}}
+	cases := []struct {
+		name, msg, wantTitle, wantReasonPart string
+	}{
+		{"valid zh", "feat(auth): 添加登录\n\n## 摘要\n\n背景说明。", "feat(auth): 添加登录", ""},
+		{"valid en", "fix: correct timeout\n\n## Summary\n\ncontext.", "fix: correct timeout", ""},
+		{"title only no body", "feat: 只有标题", "", "空一行"},
+		{"bad title format", "添加登录功能\n\n## 摘要\n\nx", "", "格式"},
+		{"type not allowed", "wip: x\n\n## 摘要\n\ny", "", "允许列表"},
+		{"body missing sections", "feat: 修复问题\n\n没有任何小节", "", "小节"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if tc.name == "valid en" {
+				setLang(t, "en")
+			}
+			title, body, reason := splitPRReply(tc.msg, cfg)
+			if title != tc.wantTitle {
+				t.Errorf("title = %q, want %q", title, tc.wantTitle)
+			}
+			if tc.wantReasonPart == "" {
+				if reason != "" {
+					t.Errorf("unexpected reason: %q", reason)
+				}
+				if body == "" {
+					t.Errorf("body should be non-empty for valid replies")
+				}
+			} else if !strings.Contains(reason, tc.wantReasonPart) {
+				t.Errorf("reason = %q, want it to contain %q", reason, tc.wantReasonPart)
+			}
+		})
+	}
+}
+
+func TestGeneratePRRetriesOnNonconforming(t *testing.T) {
+	var calls int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if atomic.AddInt32(&calls, 1) == 1 {
+			w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"# 旧格式描述\n\n## 摘要\n\n没有标题行"}}]}`))
+			return
+		}
+		w.Write([]byte(`{"choices":[{"message":{"role":"assistant","content":"feat: 新的登录修复\n\n## 摘要\n\n修复 token 校验"}}]}`))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	cfg := config.Commit{Types: []string{"feat"}, Retries: 1}
+	title, body, err := c.GeneratePR(context.Background(), cfg, []byte("diff --git a/login.go"))
+	if err != nil {
+		t.Fatalf("GeneratePR: %v", err)
+	}
+	if title != "feat: 新的登录修复" {
+		t.Errorf("title = %q", title)
+	}
+	if !strings.Contains(body, "## 摘要") {
+		t.Errorf("body = %q", body)
+	}
+	if got := atomic.LoadInt32(&calls); got != 2 {
+		t.Errorf("model called %d times, want 2 (initial + retry)", got)
 	}
 }

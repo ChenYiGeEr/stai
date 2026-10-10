@@ -32,11 +32,15 @@ func TestStagedDiffDir(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "a.txt"), []byte("hello\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := StagedDiffDir(dir); err == nil {
-		t.Fatal("expected error for no staged changes")
+	diff, err := StagedDiffDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff) != 0 {
+		t.Fatal("expected empty diff before staging")
 	}
 	exec.Command("git", "-C", dir, "add", "a.txt").Run()
-	diff, err := StagedDiffDir(dir)
+	diff, err = StagedDiffDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -99,13 +103,17 @@ func TestWorkingTreeDiffDir(t *testing.T) {
 	run("add", "committed.txt")
 	run("commit", "-m", "committed")
 
-	if _, err := WorkingTreeDiffDir(dir); err == nil {
-		t.Fatal("expected error for no working tree changes")
+	diff, err := WorkingTreeDiffDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(diff) != 0 {
+		t.Fatal("expected empty diff with a clean working tree")
 	}
 
 	// Modify a tracked file (git diff HEAD covers staged + unstaged tracked).
 	os.WriteFile(filepath.Join(dir, "committed.txt"), []byte("changed\n"), 0o644)
-	diff, err := WorkingTreeDiffDir(dir)
+	diff, err = WorkingTreeDiffDir(dir)
 	if err != nil {
 		t.Fatal(err)
 	}
