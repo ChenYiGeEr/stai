@@ -3,7 +3,6 @@ package main
 import (
 	"bufio"
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"os/signal"
@@ -18,10 +17,6 @@ import (
 	"stai/internal/config"
 	"stai/internal/i18n"
 )
-
-// errWizardCancelled is returned when the user aborts the install/config
-// wizard on the final summary screen.
-var errWizardCancelled = errors.New("wizard cancelled")
 
 // inputReader wraps stdin so prompts can be tested or redirected consistently.
 var inputReader = bufio.NewReader(os.Stdin)

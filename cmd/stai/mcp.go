@@ -11,7 +11,6 @@ import (
 	"strings"
 	"syscall"
 
-	"stai/internal/ai"
 	"stai/internal/config"
 	"stai/internal/git"
 )
@@ -241,22 +240,4 @@ func toolErrResp(req mcpRequest, msg string) mcpResponse {
 		"content": []any{map[string]any{"type": "text", "text": msg}},
 		"isError": true,
 	})
-}
-
-// buildReviewJSONOutput mirrors presentReviewJSON's schema without I/O so
-// both the CLI and the MCP server share one shape.
-func buildReviewJSONOutput(findings []ai.Finding, err error) reviewJSONOutput {
-	out := reviewJSONOutput{Complete: err == nil, Findings: make([]reviewJSONFinding, 0, len(findings))}
-	if err != nil {
-		out.Error = err.Error()
-	}
-	for _, f := range findings {
-		out.Findings = append(out.Findings, reviewJSONFinding{
-			Severity:     f.Severity,
-			Location:     f.Location,
-			Message:      f.Message,
-			SuggestedFix: f.SuggestedFix,
-		})
-	}
-	return out
 }

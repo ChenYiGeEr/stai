@@ -13,7 +13,17 @@ import (
 
 // RepoRoot returns the top-level directory of the current repository.
 func RepoRoot() (string, error) {
-	out, err := exec.Command("git", "rev-parse", "--show-toplevel").Output()
+	return RepoRootAt("")
+}
+
+// RepoRootAt returns the top-level directory of the repository at dir
+// ("" = the current directory).
+func RepoRootAt(dir string) (string, error) {
+	args := []string{"rev-parse", "--show-toplevel"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := exec.Command("git", args...).Output()
 	if err != nil {
 		return "", errors.New("not inside a git repository")
 	}

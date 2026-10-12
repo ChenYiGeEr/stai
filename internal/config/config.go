@@ -68,6 +68,18 @@ type Review struct {
 	RuleSets []ReviewRule
 }
 
+// ReviewLoop holds configuration for "stai review-loop-gen": the automated
+// fix-review cycle that runs review, sends findings to an MCP client for
+// fixing, applies the fix, and repeats until clean.
+type ReviewLoop struct {
+	MaxIterations int    // maximum review-fix iterations (0 = unlimited, capped at 100 internally)
+	Timeout       int    // overall timeout in seconds (0 = no overall timeout)
+	Strict        bool   // when true, LOW findings also count as failures
+	FixPromptPath string // optional path to a custom fix prompt template file
+	MCPTimeout    int    // per-fix-call timeout in seconds (0 = provider timeout)
+	NoMCPFallback bool   // when true, fail if MCP client is unavailable instead of manual fallback
+}
+
 // ReviewRule is one [[review.rule]] block: when a file path matches any
 // include pattern (and no exclude pattern), its rules are appended to the
 // prompt for the review group containing that file.
@@ -216,6 +228,7 @@ type Config struct {
 	Provider   Provider
 	Commit     Commit
 	Review     Review
+	ReviewLoop ReviewLoop
 	PrePush    PrePush
 	Hook       Hook
 	Notify     Notify
@@ -255,6 +268,13 @@ func Default() Config {
 			Cache:             true,
 			ValidateLocations: true,
 			Bundle:            true,
+		},
+		ReviewLoop: ReviewLoop{
+			MaxIterations: 10,
+			Timeout:       300, // 5 minutes
+			Strict:        false,
+			MCPTimeout:    30,
+			NoMCPFallback: false,
 		},
 		PrePush: PrePush{
 			BaseRef: "origin/main",
@@ -337,6 +357,15 @@ func (cfg Config) validate() error {
 	}
 	if cfg.Review.Concurrency < 1 {
 		return errors.New("review.concurrency must be at least 1")
+	}
+	if cfg.ReviewLoop.MaxIterations < 0 {
+		return errors.New("review_loop.max_iterations must not be negative")
+	}
+	if cfg.ReviewLoop.Timeout < 0 {
+		return errors.New("review_loop.timeout must not be negative")
+	}
+	if cfg.ReviewLoop.MCPTimeout < 0 {
+		return errors.New("review_loop.mcp_timeout must not be negative")
 	}
 	if cfg.PrePush.BaseRef == "" {
 		return errors.New("pre_push.base_ref must not be empty")
@@ -530,6 +559,18 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setString(raw, &cfg.Review.Model)
 	case "review.temperature":
 		err = setFloatPtr(raw, &cfg.Review.Temperature)
+	case "review_loop.max_iterations":
+		err = setInt(raw, &cfg.ReviewLoop.MaxIterations)
+	case "review_loop.timeout":
+		err = setInt(raw, &cfg.ReviewLoop.Timeout)
+	case "review_loop.strict":
+		err = setBool(raw, &cfg.ReviewLoop.Strict)
+	case "review_loop.fix_prompt_path":
+		err = setString(raw, &cfg.ReviewLoop.FixPromptPath)
+	case "review_loop.mcp_timeout":
+		err = setInt(raw, &cfg.ReviewLoop.MCPTimeout)
+	case "review_loop.no_mcp_fallback":
+		err = setBool(raw, &cfg.ReviewLoop.NoMCPFallback)
 	case "pre_push.base_ref":
 		err = setString(raw, &cfg.PrePush.BaseRef)
 	case "pre_push.strict":
@@ -859,6 +900,20 @@ model = %q
 # 独立采样温度,不填则继承 provider.temperature
 # temperature = 0.7
 
+[review_loop]
+# 最大审查-修复迭代次数(0 = 无上限,内部封顶 100)
+# max_iterations = 10
+# 整体超时(秒),0 表示无整体超时
+# timeout = 300
+# strict = true 时,LOW 级别问题也计为失败
+# strict = false
+# 自定义修复 prompt 模板文件路径
+# fix_prompt_path = ""
+# 单次 MCP 修复调用超时(秒),0 表示继承 provider.timeout_seconds
+# mcp_timeout = 30
+# 禁用 MCP 不可用时的人工降级模式
+# no_mcp_fallback = false
+
 [pre_push]
 # 分支审查的对比基准
 # base_ref = "origin/main"
@@ -980,6 +1035,20 @@ model = %q
 # model = ""
 # Separate sampling temperature; empty inherits provider.temperature
 # temperature = 0.7
+
+[review_loop]
+# Maximum review-fix iterations (0 = unlimited, internally capped at 100)
+# max_iterations = 10
+# Overall timeout in seconds (0 = no overall timeout)
+# timeout = 300
+# When strict = true, LOW findings also count as failures
+# strict = false
+# Custom fix prompt template file path
+# fix_prompt_path = ""
+# Per-fix-call timeout in seconds (0 = provider timeout)
+# mcp_timeout = 30
+# Disable manual fallback when MCP client is unavailable
+# no_mcp_fallback = false
 
 [pre_push]
 # Base ref for branch reviews
