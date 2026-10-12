@@ -31,7 +31,11 @@ func cmdDoctor(args []string) {
 	if globalPath != "" {
 		if info, err := os.Stat(globalPath); err == nil {
 			ok(i18n.T("doctor_config_exists"))
-			infof(fmt.Sprintf(i18n.T("doctor_config_perms"), info.Mode().Perm()))
+			perm := info.Mode().Perm()
+			infof(fmt.Sprintf(i18n.T("doctor_config_perms"), perm))
+			if perm&0o077 != 0 {
+				warn(fmt.Sprintf(i18n.T("doctor_config_perms_insecure"), perm, globalPath))
+			}
 		} else {
 			warn(i18n.T("doctor_config_missing"))
 		}

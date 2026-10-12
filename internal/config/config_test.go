@@ -1,6 +1,7 @@
 package config
 
 import (
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -284,6 +285,62 @@ func TestEnvOverrides(t *testing.T) {
 	}
 }
 
+func TestNoCacheEnv(t *testing.T) {
+	for _, tc := range []struct {
+		value     string
+		wantCache bool
+	}{
+		{"1", false},
+		{"true", false},
+		{"TRUE", false},
+		{"0", true},
+		{"false", true},
+		{"False", true},
+		{"no", true},
+	} {
+		t.Run(tc.value, func(t *testing.T) {
+			t.Setenv("STAI_NO_CACHE", tc.value)
+			cfg := Default()
+			applyEnv(&cfg)
+			if cfg.Review.Cache != tc.wantCache {
+				t.Errorf("STAI_NO_CACHE=%q: Cache=%v, want %v", tc.value, cfg.Review.Cache, tc.wantCache)
+			}
+		})
+	}
+}
+
+func TestDeterministicForcesSeedAndCache(t *testing.T) {
+	for _, tc := range []struct {
+		deterministic bool
+		seed          bool
+		cache         bool
+		wantSeed      bool
+		wantCache     bool
+	}{
+		{true, false, false, true, true},
+		{true, true, false, true, true},
+		{true, false, true, true, true},
+		{false, true, true, true, true},
+		{false, false, false, false, false},
+	} {
+		t.Run(fmt.Sprintf("det=%v_seed=%v_cache=%v", tc.deterministic, tc.seed, tc.cache), func(t *testing.T) {
+			// Isolate host env so only the struct fields drive applyEnv.
+			t.Setenv("STAI_REVIEW_DETERMINISTIC", "")
+			t.Setenv("STAI_REVIEW_SEED", "")
+			t.Setenv("STAI_REVIEW_CACHE", "")
+			t.Setenv("STAI_NO_CACHE", "")
+			cfg := Default()
+			cfg.Review.Deterministic = tc.deterministic
+			cfg.Review.Seed = tc.seed
+			cfg.Review.Cache = tc.cache
+			applyEnv(&cfg)
+			if cfg.Review.Seed != tc.wantSeed || cfg.Review.Cache != tc.wantCache {
+				t.Errorf("got Seed=%v Cache=%v, want Seed=%v Cache=%v", cfg.Review.Seed, cfg.Review.Cache, tc.wantSeed, tc.wantCache)
+			}
+		})
+	}
+}
+
 func TestSetBoolAcceptsCommonValues(t *testing.T) {
 	for _, tc := range []struct {
 		raw  string
@@ -309,5 +366,111 @@ func TestSetBoolAcceptsCommonValues(t *testing.T) {
 	}
 	if err := setBool("maybe", new(bool)); err == nil {
 		t.Error("setBool(maybe) should fail")
+	}
+}
+
+func TestLoadRuleSets(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, ".stai.toml")
+	content := `
+[review]
+rules = ["global rule"]
+
+[[review.rule]]
+include = ["*.go"]
+exclude = ["*_test.go"]
+rules = ["go rule", "shared"]
+
+[[review.rule]]
+include = ["*.js"]
+rules = ["js rule"]
+`
+	if err := os.WriteFile(p, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var cfg Config
+	if err := loadFile(&cfg, p); err != nil {
+		t.Fatal(err)
+	}
+	if len(cfg.Review.RuleSets) != 2 {
+		t.Fatalf("got %d rule sets, want 2", len(cfg.Review.RuleSets))
+	}
+	rs := cfg.Review.RuleSets[0]
+	if len(rs.Include) != 1 || rs.Include[0] != "*.go" {
+		t.Errorf("include: %v", rs.Include)
+	}
+	if len(rs.Exclude) != 1 || rs.Exclude[0] != "*_test.go" {
+		t.Errorf("exclude: %v", rs.Exclude)
+	}
+	if len(rs.Rules) != 2 {
+		t.Errorf("rules: %v", rs.Rules)
+	}
+
+	// Matching
+	rules, err := cfg.Review.RulesForPath("src/a.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 3 {
+		t.Errorf("src/a.go rules: %v", rules)
+	}
+	rules, err = cfg.Review.RulesForPath("src/a_test.go")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Errorf("a_test.go rules (excluded): %v", rules)
+	}
+	rules, err = cfg.Review.RulesForPath("web/app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 2 {
+		t.Errorf("app.js rules: %v", rules)
+	}
+	rules, err = cfg.Review.RulesForPath("docs/x.md")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rules) != 1 {
+		t.Errorf("x.md rules: %v", rules)
+	}
+}
+
+func TestGlobMatch(t *testing.T) {
+	cases := []struct {
+		pattern, path string
+		want          bool
+	}{
+		{"*.go", "src/a.go", true}, // no slash: matches base name
+		{"*.go", "src/a.txt", false},
+		{"src/*.go", "src/a.go", true},
+		{"src/*.go", "sub/src/a.go", false}, // has slash: full-path match only
+		{"a?c.txt", "abc.txt", true},
+		{"docs/*", "docs/x.md", true},
+	}
+	for _, c := range cases {
+		got, err := globMatch(c.pattern, c.path)
+		if err != nil {
+			t.Errorf("globMatch(%q, %q) error: %v", c.pattern, c.path, err)
+			continue
+		}
+		if got != c.want {
+			t.Errorf("globMatch(%q, %q) = %v, want %v", c.pattern, c.path, got, c.want)
+		}
+	}
+}
+
+func TestGlobMatchBadPatternErrors(t *testing.T) {
+	if _, err := globMatch("[", "src/a.go"); err == nil {
+		t.Errorf("globMatch(\"[\", ...) should report a bad-pattern error")
+	}
+}
+
+func TestValidateRejectsBadRuleGlob(t *testing.T) {
+	cfg := Default()
+	cfg.Review.RuleSets = []ReviewRule{{Include: []string{"*["}, Rules: []string{"x"}}}
+	if err := cfg.validate(); err == nil {
+		t.Errorf("validate() should reject a malformed include glob")
 	}
 }

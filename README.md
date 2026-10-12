@@ -53,6 +53,7 @@ stai uninstall                # 移除 install 写入的一切（只删 stai 自
 stai config                   # 重新运行配置向导（旧配置自动备份为 .bak）
 stai config --path            # 打印全局配置文件路径
 stai doctor                   # 诊断安装与运行环境
+stai mcp                      # 以 MCP server (stdio) 暴露 review 能力,供 Claude Code 等 MCP 客户端调用
 ```
 
 `install` 会做以下几件事：
@@ -123,9 +124,19 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
   终端手动执行 `stai review` / `stai review-branch` 仍带颜色；
 - 通知与报告文件保持纯文本。
 - 变更行数超过 `review.group_max_lines`（默认 100）时，diff 按文件分组、
-  逐组串行调用模型审查后合并排序（high → low）。小模型面对整份大 diff 会
+  逐组调用模型审查后合并排序（high → low）。小模型面对整份大 diff 会
   稀释注意力漏报问题，逐文件审查能显著缓解（借鉴 alibaba/open-code-review
   的分组设计）；
+- 默认开启 `review.deterministic = true`：stai 会基于 diff 与配置生成确定性
+  `seed`，每组使用 base seed + 组索引，让同样代码+同样配置尽量得到一致结果；
+  同时把结果缓存到 `.git/stai-review-cache.jsonl`，重复执行相同 review 时直接
+  返回缓存结果，避免重复调用模型；
+- 如需强制重新审查（忽略缓存），可传 `--no-cache` 或设置 `STAI_NO_CACHE=1`；
+- 若 provider 在审查中途超时/报错（如 6 个 group 中 1 个失败），stai 会
+  先把已成功 group 发现的 findings 展示出来，再打印错误信息，退出码为 1；
+  不会因为最后一个 group 超时而让前面已经发现的问题消失。
+- 若 provider 不支持 `seed`（如部分本地模型），日志会给出一次性警告，此时可
+  通过 `review.seed = false` 关闭 seed 发送，或整体关闭 `review.deterministic = false`；
 - 审查提示词内置两条核心原则（精确优先于召回、不报 gofmt/go vet 能查的
   静态问题）和一份精简 Go 专项清单（diff 含 `.go` 文件时注入），
   `review.rules` 可追加项目自定义规则；
@@ -138,6 +149,12 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 
 等价命令行：`stai review`；`stai review -strict` 本次运行按严格模式处理
 （发现高危问题退出码为 1，可用于脚本）。
+
+`stai review` 还支持：
+
+- `-format json [-output result.json]`：输出结构化结果 `{"complete":bool,"error":string,"findings":[...]}`，供 CI / MCP / 脚本消费；指定 `-output` 时文件存 JSON、stdout 只打印一行摘要；
+- `-resume <id>`：group 失败中断后，会话进度会记录在 `.git/stai-review-sessions.jsonl`（7 天 TTL），失败提示会给出 8 位短 ID，重跑时只审查剩余分组；
+- `-no-cache`、`-no-validate-locations`：单次跳过缓存 / 定位校验。
 
 ### 分支级辅助（M3-A/B/C）
 
@@ -264,6 +281,9 @@ report_path = ".git/stai-review.md"
 group_max_lines = 100
 concurrency = 4                                  # 多组审查的并发数；远端 provider 有效，本地单 GPU 会排队，1 = 串行
 suggest_fixes = true                             # 为每条问题请求模型给出修改建议
+deterministic = true                             # 基于 diff+配置生成确定性 seed 并启用结果缓存
+seed = true                                      # 在请求中发送 seed（需 provider 支持）
+cache = true                                     # 启用 .git/stai-review-cache.jsonl 本地结果缓存
 # rules = ["所有新函数的错误必须 logf 或向上返回"]  # 项目附加审查规则
 # base_url = "" / api_key = "" / model = ""        # review 专用模型，留空继承 [provider]
 # temperature = 1                                  # 模型只接受 temperature=1 时设置（如部分推理模型），缺省继承 [provider]
@@ -301,7 +321,7 @@ path = "~/Library/Logs/stai.log"
 | `provider.base_url` | `http://localhost:11434/v1` | OpenAI 兼容接口地址（Ollama、LM Studio、网关均可） |
 | `provider.api_key` | `""` | 接口密钥，本地模型留空 |
 | `provider.model` | `qwen2.5-coder:7b` | 模型名称 |
-| `provider.timeout_seconds` | `120` | 单次模型请求超时（秒） |
+| `provider.timeout_seconds` | `120` | 单次模型请求/每个 review group 的超时（秒）；review 的每个 group 独立计时，多个 group 不会共享一个全局倒计时 |
 | `provider.temperature` | `0` | 请求 temperature，`0` 为确定性输出；个别模型只接受 `1` |
 | `commit.style` | `conventional` | 目前只支持 `conventional`，其他值会报错 |
 | `commit.types` | `feat` … `ci`（共 10 种） | 允许的 type；不在列表中的输出会被重试，仍不合规则报错 |
@@ -317,7 +337,13 @@ path = "~/Library/Logs/stai.log"
 | `review.group_max_lines` | `100` | 变更行数超过该值时按文件分组审查后合并（借鉴 open-code-review 的分组阈值） |
 | `review.concurrency` | `4` | 多组审查的并发数；远端 provider 按并发数缩短墙钟时间，本地单 GPU 会排队，`1` = 串行 |
 | `review.suggest_fixes` | `true` | `true` 时请求模型为每条问题给出具体修改建议，显示在 stdout 与报告文件中；通知仍只显示摘要，避免过长 |
+| `review.deterministic` | `true` | `true` 时基于 diff+配置生成确定性 seed 并启用结果缓存，让重复 review 结果一致 |
+| `review.seed` | `true` | `true` 时在请求中发送 `seed`；provider 不支持时可设为 `false` |
+| `review.cache` | `true` | `true` 时启用 `.git/stai-review-cache.jsonl` 本地结果缓存 |
+| `review.validate_locations` | `true` | 校验 findings 的文件/行号确实出现在本次 diff 中，丢弃漂移的 location；单次关闭用 `stai review -no-validate-locations` |
+| `review.bundle` | `true` | 智能分块：同目录、本地化后缀（`_en`/`_zh`）、测试/平台后缀的相关文件优先分到同一审查组（借鉴 open-code-review 的 smart bundling） |
 | `review.rules` | `[]` | 项目附加审查规则，原样注入审查提示词 |
+| `[[review.rule]]` | （无） | 按路径追加规则：`include`/`exclude` 为 glob（无 `/` 时同时匹配文件名），命中的文件在全局 rules 之外额外收到该组 rules |
 | `review.base_url` / `review.api_key` / `review.model` | 继承 `[provider]` | review 专用模型覆盖，留空继承全局；可让 review 用大模型、gen 用本地快模型 |
 | `review.temperature` | 继承 `provider.temperature` | 仅当 review 模型对 temperature 有限制时设置（如只接受 `1` 的推理模型） |
 | `hook.timeout_seconds` | `120` | 钩子的总超时（秒），对 `prepare-commit-msg`、`pre-commit`、`pre-push` 都生效 |
@@ -369,13 +395,21 @@ go run ./cmd/stai help         # 查看命令帮助
 ## 目录结构
 
 ```
-cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor）
-internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/PR 标题/stash 信息/文件解释/拆分建议/changelog 生成与提交前/分支审查（中英双语提示词）
+cmd/stai/        CLI 入口与子命令（gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor / mcp）
+internal/ai      OpenAI 兼容接口客户端、提交信息/PR 描述/PR 标题/stash 信息/文件解释/拆分建议/changelog 生成与提交前/分支审查（中英双语提示词）、review 缓存与会话
 internal/config  分层配置加载
 internal/git     git 命令封装（暂存区 diff、分支 diff、工作树 diff、git log、标签、钩子路径）
 internal/i18n    CLI 文案中英对照表与语言切换
 docs/            设计说明（design.md）
 ```
+
+## 安全
+
+安全设计与加固说明（配置文件权限、路径校验、威胁模型）见 [SECURITY.md](SECURITY.md)。
+
+## MCP Server
+
+`stai mcp` 以 stdio JSON-RPC 暴露一个 `review_diff` 工具（输入 diff 文本或 `repo_dir`，返回与 `-format json` 相同的结构化结果），可在 Claude Code、Cursor 等 MCP 客户端中把 stai 的审查能力作为工具调用。
 
 ## 路线图
 

@@ -40,6 +40,9 @@ func loadConfig() config.Config {
 		// active language (for invalid values that is the zh-CN fallback).
 		fmt.Fprintf(os.Stderr, i18n.T("lang_fallback")+"\n", cfg.Global.Lang)
 	}
+	if insecure, perm := config.FileInsecure(); insecure {
+		fmt.Fprintf(os.Stderr, i18n.T("config_perms_insecure")+"\n", perm, config.GlobalPath())
+	}
 	logPath = cfg.Log.Path
 	return cfg
 }
@@ -94,6 +97,8 @@ func main() {
 		cmdHook(args)
 	case "review":
 		cmdReview(args)
+	case "mcp":
+		cmdMCP(args)
 	case "mergetool":
 		cmdMergetool(args)
 	case "install":
@@ -126,7 +131,7 @@ func usage() {
 		{i18n.T("usage_group_generate"), []string{"gen", "pr", "pr-title", "stash-msg", "split", "changelog"}},
 		{i18n.T("usage_group_review"), []string{"review", "review-branch"}},
 		{i18n.T("usage_group_explain"), []string{"explain"}},
-		{i18n.T("usage_group_setup"), []string{"install", "uninstall", "config", "doctor", "version"}},
+		{i18n.T("usage_group_setup"), []string{"install", "uninstall", "config", "doctor", "mcp", "version"}},
 		{i18n.T("usage_group_system"), []string{"hook", "mergetool"}},
 	}
 
@@ -251,7 +256,7 @@ func hookPrePush() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff)
+	findings, err := generateReview(ctx, cfg, diff, false, false, "")
 	if err != nil {
 		logf("hook pre-push: %v (passing)", err)
 		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_push")+"\n", err)
@@ -387,7 +392,15 @@ func cmdReviewBranch(args []string) {
 	fs := flag.NewFlagSet("review-branch", flag.ExitOnError)
 	strictFlag := fs.Bool("strict", false, "exit non-zero on high-severity findings")
 	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
+	noCacheFlag := fs.Bool("no-cache", false, "bypass the local review cache")
+	noValidateFlag := fs.Bool("no-validate-locations", false, "skip file/line validation of findings")
+	formatFlag := fs.String("format", "text", "output format: text or json")
+	outputFlag := fs.String("output", "", "write output to file instead of stdout (json format only)")
+	resumeFlag := fs.String("resume", "", "resume an interrupted review by session id")
 	fs.Parse(args)
+	if *formatFlag != "text" && *formatFlag != "json" {
+		fatal(fmt.Errorf("invalid -format %q (want text or json)", *formatFlag))
+	}
 
 	cfg := loadConfig()
 
@@ -402,8 +415,8 @@ func cmdReviewBranch(args []string) {
 	}
 
 	baseRef := cfg.PrePush.BaseRef
-	reviewBaseURL, _, reviewModel, _ := reviewProvider(cfg)
-	logf("review-branch start args=%q model=%s base_url=%s base=%s", args, reviewModel, reviewBaseURL, baseRef)
+	reviewBaseURL, _, reviewModel, reviewTemperature := reviewProvider(cfg)
+	logf("review-branch start args=%q model=%s base_url=%s base=%s temperature=%v", args, reviewModel, reviewBaseURL, baseRef, reviewTemperature)
 
 	diff, err := git.BranchDiffDir(repoDir, baseRef)
 	fatal(err)
@@ -412,32 +425,18 @@ func cmdReviewBranch(args []string) {
 		return
 	}
 
-	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff)
-	if err != nil {
-		logf("review-branch error: %v", err)
-		fatal(err)
+	findings, err := generateReview(ctx, cfg, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
+	var code int
+	if *formatFlag == "json" {
+		code = presentReviewJSON(findings, err, *outputFlag, "review-branch")
+	} else {
+		code = presentReview(cfg, repoDir, findings, err, *noColorFlag, "review-branch")
 	}
-	logf("review-branch done findings=%d high=%v", len(findings), ai.HasHigh(findings))
-
-	report := renderFindings(findings, !*noColorFlag, true)
-	fmt.Print(report)
-
-	// Notifications must stay plain-text (no ANSI) and concise (no fixes).
-	plainReport := renderFindings(findings, false, false)
-	notifBody := plainReport
-	subtitle := i18n.T("review_subtitle_done")
-	if len(findings) > cfg.Review.NotifyMaxFindings {
-		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
-			notifBody = fmt.Sprintf(i18n.T("review_report_notice"), path, severitySummary(findings))
-			subtitle = i18n.T("review_subtitle_file")
-		} else {
-			logf("review-branch report file write failed: %v", werr)
-			notifBody = severitySummary(findings)
-		}
+	if code != 0 {
+		os.Exit(code)
 	}
-	notify(cfg.Notify.Title, subtitle, notifBody)
 
 	if (*strictFlag || cfg.PrePush.Strict) && ai.HasHigh(findings) {
 		logf("review-branch blocked push (strict, high severity)")
@@ -808,7 +807,7 @@ func hookPreCommit() {
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff)
+	findings, err := generateReview(ctx, cfg, diff, false, false, "")
 	if err != nil {
 		logf("hook pre-commit: %v (passing)", err)
 		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_commit")+"\n", err)
@@ -1319,7 +1318,15 @@ func cmdReview(args []string) {
 	fs := flag.NewFlagSet("review", flag.ExitOnError)
 	strictFlag := fs.Bool("strict", false, "exit non-zero on high-severity findings (pre-commit mode)")
 	noColorFlag := fs.Bool("no-color", false, "disable ANSI colors in output")
+	noCacheFlag := fs.Bool("no-cache", false, "bypass the local review cache")
+	noValidateFlag := fs.Bool("no-validate-locations", false, "skip file/line validation of findings")
+	formatFlag := fs.String("format", "text", "output format: text or json")
+	outputFlag := fs.String("output", "", "write output to file instead of stdout (json format only)")
+	resumeFlag := fs.String("resume", "", "resume an interrupted review by session id")
 	fs.Parse(args)
+	if *formatFlag != "text" && *formatFlag != "json" {
+		fatal(fmt.Errorf("invalid -format %q (want text or json)", *formatFlag))
+	}
 
 	cfg := loadConfig()
 
@@ -1332,8 +1339,8 @@ func cmdReview(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
-	reviewBaseURL, _, reviewModel, _ := reviewProvider(cfg)
-	logf("review start args=%q model=%s base_url=%s", args, reviewModel, reviewBaseURL)
+	reviewBaseURL, _, reviewModel, reviewTemperature := reviewProvider(cfg)
+	logf("review start args=%q model=%s base_url=%s temperature=%v", args, reviewModel, reviewBaseURL, reviewTemperature)
 
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
@@ -1342,35 +1349,18 @@ func cmdReview(args []string) {
 		os.Exit(2)
 	}
 
-	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
+	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff)
-	if err != nil {
-		logf("review error: %v", err)
-		fatal(err)
+	findings, err := generateReview(ctx, cfg, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
+	var code int
+	if *formatFlag == "json" {
+		code = presentReviewJSON(findings, err, *outputFlag, "review")
+	} else {
+		code = presentReview(cfg, repoDir, findings, err, *noColorFlag, "review")
 	}
-	logf("review done findings=%d high=%v", len(findings), ai.HasHigh(findings))
-
-	report := renderFindings(findings, !*noColorFlag, true)
-	fmt.Print(report)
-
-	// SourceTree discards stdout, so the report also goes to a
-	// notification: the full text when it fits, otherwise a summary plus
-	// the report-file path. Notifications must stay plain-text (no ANSI) and
-	// concise (no fixes).
-	plainReport := renderFindings(findings, false, false)
-	notifBody := plainReport
-	subtitle := i18n.T("review_subtitle_done")
-	if len(findings) > cfg.Review.NotifyMaxFindings {
-		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
-			notifBody = fmt.Sprintf(i18n.T("review_report_notice"), path, severitySummary(findings))
-			subtitle = i18n.T("review_subtitle_file")
-		} else {
-			logf("review report file write failed: %v", werr)
-			notifBody = severitySummary(findings)
-		}
+	if code != 0 {
+		os.Exit(code)
 	}
-	notify(cfg.Notify.Title, subtitle, notifBody)
 
 	if (*strictFlag || cfg.Review.Strict) && ai.HasHigh(findings) {
 		logf("review blocked commit (strict, high severity)")
@@ -1401,20 +1391,58 @@ func reviewProvider(cfg config.Config) (baseURL, apiKey, model string, temperatu
 
 // generateReview asks the configured model to review diff. Both the review
 // command and the pre-commit hook use it so provider wiring lives in one place.
-func generateReview(ctx context.Context, cfg config.Config, diff []byte) ([]ai.Finding, error) {
+func generateReview(ctx context.Context, cfg config.Config, diff []byte, noCache, noValidateLocations bool, resumeID string) ([]ai.Finding, error) {
 	baseURL, apiKey, model, temperature := reviewProvider(cfg)
 	client := ai.NewClient(baseURL, apiKey, model,
 		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	client.Temperature = temperature
+	client.Logf = logf
+
+	cachePath := ""
+	if cfg.Review.Cache {
+		if root, err := git.RepoRoot(); err == nil {
+			cachePath, err = ai.ReviewCachePath(root)
+			if err != nil {
+				logf("review cache disabled: %v", err)
+				cachePath = ""
+			}
+		} else {
+			logf("review cache disabled: %v", err)
+		}
+	}
+
+	sessionPath := ""
+	if root, err := git.RepoRoot(); err == nil {
+		if sp, serr := ai.ReviewSessionPath(root); serr == nil {
+			sessionPath = sp
+		} else {
+			logf("review sessions disabled: %v", serr)
+		}
+	} else {
+		logf("review sessions disabled: %v", err)
+	}
+
 	return client.GenerateReview(ctx, ai.ReviewParams{
-		Diff:          diff,
-		MaxChars:      cfg.Commit.MaxDiffChars,
-		Retries:       cfg.Commit.Retries,
-		GroupMaxLines: cfg.Review.GroupMaxLines,
-		Rules:         cfg.Review.Rules,
-		Concurrency:   cfg.Review.Concurrency,
-		SuggestFixes:  cfg.Review.SuggestFixes,
-		Logf:          logf,
+		Diff:              diff,
+		MaxChars:          cfg.Commit.MaxDiffChars,
+		Retries:           cfg.Commit.Retries,
+		GroupMaxLines:     cfg.Review.GroupMaxLines,
+		Concurrency:       cfg.Review.Concurrency,
+		Timeout:           cfg.Provider.TimeoutSec,
+		Rules:             cfg.Review.Rules,
+		RuleSets:          cfg.Review.RuleSets,
+		Bundle:            cfg.Review.Bundle,
+		SuggestFixes:      cfg.Review.SuggestFixes,
+		Strict:            cfg.Review.Strict,
+		Deterministic:     cfg.Review.Deterministic,
+		Seed:              cfg.Review.Seed,
+		Cache:             cfg.Review.Cache,
+		NoCache:           noCache,
+		SessionPath:       sessionPath,
+		ResumeID:          resumeID,
+		ValidateLocations: cfg.Review.ValidateLocations && !noValidateLocations,
+		CachePath:         cachePath,
+		Logf:              logf,
 	})
 }
 
@@ -1477,6 +1505,113 @@ func severitySummary(findings []ai.Finding) string {
 		}
 	}
 	return fmt.Sprintf(i18n.T("review_summary"), high, medium, low, other)
+}
+
+// yellowText returns s in yellow when color is enabled, otherwise plain s.
+func yellowText(s string, enabled bool) string {
+	if enabled {
+		return color.Yellow(s)
+	}
+	return s
+}
+
+// presentReview renders the review report to stdout, sends the notification,
+// and returns the desired exit code. If err is non-nil but partial findings
+// were returned, the partial results are shown with an incomplete warning and
+// the function returns 1.
+func presentReview(cfg config.Config, repoDir string, findings []ai.Finding, err error, noColor bool, command string) int {
+	if err != nil && len(findings) == 0 {
+		logf("%s error: %v", command, err)
+		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		return 1
+	}
+
+	incomplete := err != nil
+	var b strings.Builder
+	if incomplete {
+		fmt.Fprintln(&b, yellowText(i18n.T("review_incomplete_header"), !noColor))
+	}
+	b.WriteString(renderFindings(findings, !noColor, true))
+	if incomplete {
+		fmt.Fprintln(&b, yellowText(fmt.Sprintf(i18n.T("review_incomplete_footer"), err), !noColor))
+	}
+	fmt.Print(b.String())
+
+	// Notifications must stay plain-text and concise.
+	plainReport := renderFindings(findings, false, false)
+	notifBody := plainReport
+	subtitle := i18n.T("review_subtitle_done")
+	if incomplete || len(findings) > cfg.Review.NotifyMaxFindings {
+		if path, werr := writeReportFile(cfg, repoDir, findings); werr == nil {
+			notifBody = fmt.Sprintf(i18n.T("review_report_notice"), path, severitySummary(findings))
+			if incomplete {
+				subtitle = i18n.T("review_subtitle_incomplete")
+			} else {
+				subtitle = i18n.T("review_subtitle_file")
+			}
+		} else {
+			logf("%s report file write failed: %v", command, werr)
+			notifBody = severitySummary(findings)
+			if incomplete {
+				subtitle = i18n.T("review_subtitle_incomplete")
+			}
+		}
+	}
+	if incomplete {
+		notifBody = i18n.T("review_incomplete_header") + "\n" + notifBody
+	}
+	notify(cfg.Notify.Title, subtitle, notifBody)
+
+	if incomplete {
+		logf("%s incomplete findings=%d high=%v error=%v", command, len(findings), ai.HasHigh(findings), err)
+		return 1
+	}
+	logf("%s done findings=%d high=%v", command, len(findings), ai.HasHigh(findings))
+	return 0
+}
+
+// reviewJSONFinding is the machine-readable form of one finding. It mirrors
+// ai.Finding but with stable JSON tags so the output schema does not drift
+// with Go field renames.
+type reviewJSONFinding struct {
+	Severity     string `json:"severity"`
+	Location     string `json:"location,omitempty"`
+	Message      string `json:"message"`
+	SuggestedFix string `json:"suggested_fix,omitempty"`
+}
+
+// reviewJSONOutput is the top-level JSON result of a review run.
+type reviewJSONOutput struct {
+	Complete bool                `json:"complete"`
+	Error    string              `json:"error,omitempty"`
+	Findings []reviewJSONFinding `json:"findings"`
+}
+
+// presentReviewJSON renders findings as JSON. When output is non-empty the
+// JSON is written to that file and a one-line human summary goes to stdout;
+// otherwise the JSON goes to stdout and nothing else is printed.
+// Notifications and the markdown report file are skipped in JSON mode.
+func presentReviewJSON(findings []ai.Finding, err error, output, command string) int {
+	out := buildReviewJSONOutput(findings, err)
+	data, e := json.MarshalIndent(out, "", "  ")
+	if e != nil {
+		fmt.Fprintf(os.Stderr, "stai: %v\n", e)
+		return 1
+	}
+	if output != "" {
+		if err := os.WriteFile(output, append(data, '\n'), 0o644); err != nil {
+			fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+			return 1
+		}
+		fmt.Printf(i18n.T("review_json_saved")+"\n", output)
+	} else {
+		fmt.Println(string(data))
+	}
+	logf("%s json output complete=%v findings=%d", command, out.Complete, len(findings))
+	if !out.Complete {
+		return 1
+	}
+	return 0
 }
 
 // writeReportFile saves the full report under the repo (default

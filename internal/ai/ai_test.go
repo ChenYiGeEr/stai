@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -995,4 +996,432 @@ func TestGeneratePRRetriesOnNonconforming(t *testing.T) {
 	if got := atomic.LoadInt32(&calls); got != 2 {
 		t.Errorf("model called %d times, want 2 (initial + retry)", got)
 	}
+}
+
+func TestGenerateReviewCacheHitSkipsProvider(t *testing.T) {
+	setLang(t, "en")
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "cache.jsonl")
+
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		json.NewEncoder(w).Encode(reply("OK"))
+	}))
+	defer srv.Close()
+
+	// Pre-populate cache using the same effective provider URL/model/temperature.
+	findings := []Finding{{Severity: "high", Location: "a.go:1", Message: "cached"}}
+	entries := []reviewCacheEntry{{
+		Key:       MakeReviewCacheKey([]byte("diff"), "test-model", srv.URL, 0, nil, true, false, "en", true, true, 100, 0, false, nil, false),
+		Findings:  findings,
+		Timestamp: time.Now(),
+	}}
+	if err := SaveReviewCache(cachePath, entries); err != nil {
+		t.Fatalf("save cache: %v", err)
+	}
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	c.Temperature = 0
+	got, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff:          []byte("diff"),
+		GroupMaxLines: 100,
+		Concurrency:   1,
+		SuggestFixes:  true,
+		Strict:        false,
+		Deterministic: true,
+		Seed:          true,
+		Cache:         true,
+		CachePath:     cachePath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if calls != 0 {
+		t.Errorf("provider called %d times, expected cache hit", calls)
+	}
+	if len(got) != 1 || got[0].Message != "cached" {
+		t.Errorf("unexpected findings: %+v", got)
+	}
+}
+
+func TestGenerateReviewCacheHitCleansStaleSession(t *testing.T) {
+	setLang(t, "en")
+	dir := t.TempDir()
+	cachePath := filepath.Join(dir, "cache.jsonl")
+	sessionPath := filepath.Join(dir, "sessions.jsonl")
+
+	// Pre-populate both a cache hit and a stale session for the same key.
+	key := MakeReviewCacheKey([]byte("diff"), "test-model", "http://x", 0, nil, false, false, "en", true, true, 100, 0, false, nil, false)
+	findings := []Finding{{Severity: "high", Location: "a.go:1", Message: "cached"}}
+	if err := SaveReviewCache(cachePath, []reviewCacheEntry{{Key: key, Findings: findings, Timestamp: time.Now()}}); err != nil {
+		t.Fatalf("save cache: %v", err)
+	}
+	if err := UpsertReviewSession(sessionPath, reviewSession{ID: key, Timestamp: time.Now(), CompletedGroups: []int{1}, TotalGroups: 2, Findings: findings}); err != nil {
+		t.Fatalf("save session: %v", err)
+	}
+
+	c := NewClient("http://x", "", "test-model", time.Minute)
+	c.Temperature = 0
+	_, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff:          []byte("diff"),
+		GroupMaxLines: 100,
+		Concurrency:   1,
+		Deterministic: true,
+		Seed:          true,
+		Cache:         true,
+		CachePath:     cachePath,
+		SessionPath:   sessionPath,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	entries, err := LoadReviewSessions(sessionPath)
+	if err != nil {
+		t.Fatalf("load sessions: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("expected stale session to be deleted, got %d entries", len(entries))
+	}
+}
+
+func TestGenerateReviewSendsSeedPerGroup(t *testing.T) {
+	setLang(t, "en")
+	var seeds []int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		if req.Seed != nil {
+			seeds = append(seeds, *req.Seed)
+		}
+		json.NewEncoder(w).Encode(reply("OK"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	c.Temperature = 0
+	_, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff:          []byte("diff --git a/f1 b/f1\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/f2 b/f2\n@@ -1 +1 @@\n-c\n+d\n"),
+		GroupMaxLines: 1,
+		Concurrency:   1,
+		SuggestFixes:  true,
+		Strict:        false,
+		Deterministic: true,
+		Seed:          true,
+		Cache:         false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(seeds) != 2 {
+		t.Fatalf("expected 2 seeded calls, got %d", len(seeds))
+	}
+	if seeds[0] == 0 || seeds[1] == 0 {
+		t.Errorf("seeds should be non-zero: %v", seeds)
+	}
+	if seeds[0] == seeds[1] {
+		t.Errorf("per-group seeds should differ: %v", seeds)
+	}
+}
+
+func TestGenerateReviewNoSeedWhenDisabled(t *testing.T) {
+	setLang(t, "en")
+	var hasSeed bool
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var req chatRequest
+		json.NewDecoder(r.Body).Decode(&req)
+		hasSeed = req.Seed != nil
+		json.NewEncoder(w).Encode(reply("OK"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	_, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff:          []byte("diff --git a/x b/x\n@@ -1 +1 @@\n-a\n+b"),
+		GroupMaxLines: 100,
+		Concurrency:   1,
+		SuggestFixes:  false,
+		Deterministic: false,
+		Seed:          true,
+		Cache:         false,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if hasSeed {
+		t.Errorf("seed sent even though deterministic=false")
+	}
+}
+
+func TestGenerateReviewReturnsPartialFindingsOnGroupFailure(t *testing.T) {
+	setLang(t, "en")
+	var calls int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("b/b.go")) {
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(reply("[HIGH] a.go:1 - bug in a"))
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	diff := []byte("diff --git a/a/a.go b/a/a.go\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/b/b.go b/b/b.go\n@@ -1 +1 @@\n-c\n+d\n")
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: diff, GroupMaxLines: 1, Concurrency: 1,
+	})
+	if err == nil {
+		t.Fatal("expected error from failing group")
+	}
+	if len(findings) != 1 || findings[0].Message != "bug in a" {
+		t.Errorf("expected partial finding 'bug in a', got %+v", findings)
+	}
+}
+
+func TestGenerateReviewParallelReturnsPartialFindings(t *testing.T) {
+	setLang(t, "en")
+	okCh := make(chan struct{}, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		if bytes.Contains(body, []byte("b/b.go")) {
+			// Block until both success handlers have replied, so their
+			// findings are always collected regardless of scheduling
+			// order (no time.Sleep — deterministic under CI load).
+			<-okCh
+			<-okCh
+			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		}
+		json.NewEncoder(w).Encode(reply("[HIGH] a.go:1 - bug"))
+		okCh <- struct{}{}
+	}))
+	defer srv.Close()
+
+	c := NewClient(srv.URL, "", "test-model", time.Minute)
+	diff := []byte("diff --git a/a/a.go b/a/a.go\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/b/b.go b/b/b.go\n@@ -1 +1 @@\n-c\n+d\ndiff --git a/c/c.go b/c/c.go\n@@ -1 +1 @@\n-e\n+f\n")
+	findings, err := c.GenerateReview(context.Background(), ReviewParams{
+		Diff: diff, GroupMaxLines: 1, Concurrency: 3,
+	})
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if len(findings) < 1 {
+		t.Errorf("expected at least one partial finding, got %d", len(findings))
+	}
+}
+
+func TestParseDiffRanges(t *testing.T) {
+	diff := []byte(`diff --git a/src/a.go b/src/a.go
+index 1234..5678 100644
+--- a/src/a.go
++++ b/src/a.go
+@@ -10,5 +10,6 @@ func main() {
+ context
+-old
++new
++extra
+@@ -30,4 +31,2 @@ func other() {
+ removed
+ context
+diff --git a/README.md b/README.md
+--- /dev/null
++++ b/README.md
+@@ -0,0 +1,2 @@
++line1
++line2
+diff --git a/gone.txt b/gone.txt
+--- a/gone.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-gone1
+-gone2
+`)
+	ranges := parseDiffRanges(diff)
+
+	a := ranges["src/a.go"]
+	if len(a) != 2 {
+		t.Fatalf("src/a.go ranges: got %v, want 2", a)
+	}
+	if a[0] != [2]int{10, 15} {
+		t.Errorf("src/a.go range 1: got %v, want [10 15]", a[0])
+	}
+	if a[1] != [2]int{31, 32} {
+		t.Errorf("src/a.go range 2: got %v, want [31 32]", a[1])
+	}
+	if r := ranges["README.md"]; len(r) != 1 || r[0] != [2]int{1, 2} {
+		t.Errorf("README.md ranges: got %v, want [[1 2]]", r)
+	}
+	if _, ok := ranges["gone.txt"]; ok {
+		t.Errorf("gone.txt should not have ranges (deleted file)")
+	}
+}
+
+func TestSplitLocation(t *testing.T) {
+	cases := []struct {
+		loc  string
+		path string
+		line int
+	}{
+		{"src/a.go:42", "src/a.go", 42},
+		{"src/a.go", "src/a.go", 0},
+		{"src/a.go:abc", "src/a.go:abc", 0}, // malformed line: keep whole string as path (will be dropped by validation)
+		{"a/b/c.go:7:8", "a/b/c.go:7", 8},
+		{"", "", 0},
+	}
+	for _, c := range cases {
+		p, n := splitLocation(c.loc)
+		if p != c.path || n != c.line {
+			t.Errorf("splitLocation(%q) = (%q, %d), want (%q, %d)", c.loc, p, n, c.path, c.line)
+		}
+	}
+}
+
+func TestFilterValidLocations(t *testing.T) {
+	diff := []byte(`diff --git a/src/a.go b/src/a.go
+--- a/src/a.go
++++ b/src/a.go
+@@ -10,3 +10,4 @@
+ context
+-old
++new
++extra
+`)
+	ranges := parseDiffRanges(diff)
+	c := NewClient("http://127.0.0.1:1", "", "test", 0)
+	p := ReviewParams{ValidateLocations: true, Logf: func(string, ...any) {}}
+	findings := []Finding{
+		{Severity: "high", Location: "src/a.go:11", Message: "ok in range"},
+		{Severity: "medium", Location: "src/a.go:999", Message: "line out of range"},
+		{Severity: "low", Location: "other/file.go:1", Message: "file not in diff"},
+		{Severity: "medium", Location: "src/a.go", Message: "file-level ok"},
+		{Severity: "medium", Message: "advisory, no location"},
+	}
+	got := c.filterValidLocations(p, findings, ranges)
+	if len(got) != 3 {
+		t.Fatalf("kept %d findings, want 3: %v", len(got), got)
+	}
+	for _, f := range got {
+		switch f.Message {
+		case "line out of range", "file not in diff":
+			t.Errorf("should have been dropped: %v", f)
+		}
+	}
+
+	// Disabled validation keeps everything.
+	p.ValidateLocations = false
+	if got := c.filterValidLocations(p, findings, ranges); len(got) != 5 {
+		t.Errorf("validation disabled: kept %d findings, want 5", len(got))
+	}
+}
+
+func TestDiffFilePaths(t *testing.T) {
+	chunk := []byte(`diff --git a/src/a.go b/src/a.go
+--- a/src/a.go
++++ b/src/a.go
+@@ -1,1 +1,1 @@
+diff --git a/gone.txt b/gone.txt
+--- a/gone.txt
++++ /dev/null
+`)
+	got := diffFilePaths(chunk)
+	if len(got) != 1 || got[0] != "src/a.go" {
+		t.Errorf("diffFilePaths = %v, want [src/a.go]", got)
+	}
+}
+
+func TestGroupRules(t *testing.T) {
+	p := ReviewParams{
+		Rules: []string{"global"},
+		RuleSets: []config.ReviewRule{
+			{Include: []string{"*.go"}, Rules: []string{"go rule"}},
+			{Include: []string{"*.js"}, Rules: []string{"js rule"}},
+		},
+	}
+	group := []byte("diff --git a/src/a.go b/src/a.go\n+++ b/src/a.go\n")
+	got := groupRules(p, group)
+	if len(got) != 2 || got[0] != "global" || got[1] != "go rule" {
+		t.Errorf("groupRules(go) = %v, want [global go rule]", got)
+	}
+	jsGroup := []byte("+++ b/web/app.js\n")
+	if got := groupRules(p, jsGroup); len(got) != 2 || got[1] != "js rule" {
+		t.Errorf("groupRules(js) = %v", got)
+	}
+	// No rule sets: global rules pass through unchanged.
+	p.RuleSets = nil
+	if got := groupRules(p, group); len(got) != 1 || got[0] != "global" {
+		t.Errorf("groupRules(no sets) = %v", got)
+	}
+}
+
+func TestRuleSetKeyInSeedAndCache(t *testing.T) {
+	sets := []config.ReviewRule{{Include: []string{"*.go"}, Rules: []string{"go rule"}}}
+	if ruleSetKey(nil) != "" {
+		t.Errorf("ruleSetKey(nil) should be empty")
+	}
+	if ruleSetKey(sets) == "" {
+		t.Errorf("ruleSetKey(sets) should be non-empty")
+	}
+}
+
+func TestReorderDiffBundlesRelatedFiles(t *testing.T) {
+	mk := func(a, b string, body string) string {
+		return fmt.Sprintf("diff --git a/%s b/%s\n--- a/%s\n+++ b/%s\n%s", a, b, a, b, body)
+	}
+	// Interleaved so original order scatters related files.
+	diff := []byte(
+		mk("src/util.go", "src/util.go", "@@ -1,1 +1,1 @@\n-a\n+b\n") +
+			mk("docs/readme.md", "docs/readme.md", "@@ -1,1 +1,1 @@\n-a\n+b\n") +
+			mk("src/messages_en.properties", "src/messages_en.properties", "@@ -1,1 +1,1 @@\n-a\n+b\n") +
+			mk("src/util_test.go", "src/util_test.go", "@@ -1,1 +1,1 @@\n-a\n+b\n") +
+			mk("src/messages_zh.properties", "src/messages_zh.properties", "@@ -1,1 +1,1 @@\n-a\n+b\n"))
+	got := string(reorderDiff(diff, true))
+	// util.go and util_test.go must be adjacent; en/zh property files adjacent.
+	iUtil := strings.Index(got, "b/src/util.go\n")
+	iUtilTest := strings.Index(got, "b/src/util_test.go\n")
+	iEn := strings.Index(got, "b/src/messages_en.properties")
+	iZh := strings.Index(got, "b/src/messages_zh.properties")
+	if iUtil < 0 || iUtilTest < 0 || iEn < 0 || iZh < 0 {
+		t.Fatalf("reordered diff lost files: %s", got)
+	}
+	if abs(iUtil-iUtilTest) > len("diff --git a/src/util.go b/src/util.go\n")+200 {
+		t.Errorf("util.go and util_test.go not adjacent")
+	}
+	if abs(iEn-iZh) > 200 {
+		t.Errorf("locale property files not adjacent")
+	}
+	// Bundle disabled: input returned unchanged.
+	if !bytes.Equal(reorderDiff(diff, false), diff) {
+		t.Errorf("bundle=false must return the diff unchanged")
+	}
+}
+
+func TestBundleKey(t *testing.T) {
+	cases := []struct {
+		paths []string
+		want  string
+	}{
+		{[]string{"src/messages_en.properties"}, "src/\x00messages.properties"},
+		{[]string{"src/messages_zh.properties"}, "src/\x00messages.properties"},
+		{[]string{"src/util_test.go"}, "src/\x00util.go"},
+		{[]string{"src/util.go"}, "src/\x00util.go"},
+		{[]string{"term_darwin.go"}, "\x00term.go"},
+	}
+	for _, c := range cases {
+		if got := bundleKey(c.paths); got != c.want {
+			t.Errorf("bundleKey(%v) = %q, want %q", c.paths, got, c.want)
+		}
+	}
+	if got := bundleKey(nil); got != "\x00\x00" {
+		t.Errorf("bundleKey(nil) = %q", got)
+	}
+}
+
+func abs(n int) int {
+	if n < 0 {
+		return -n
+	}
+	return n
 }

@@ -50,6 +50,7 @@ stai uninstall                # remove everything install wrote (stai-owned entr
 stai config                   # re-run the config wizard (old config is backed up to .bak)
 stai config --path            # print the global config path
 stai doctor                   # check the stai installation and runtime environment
+stai mcp                      # expose the review capability as an MCP server (stdio) for MCP clients
 ```
 
 `install` does the following:
@@ -146,6 +147,17 @@ Stage your changes, then run **Actions → Custom Actions → AI 审查改动**
   sorted (high → low). Small models miss issues in large diffs that dilute
   their attention; per-file review mitigates this (grouping design borrowed
   from alibaba/open-code-review);
+- `review.deterministic` defaults to `true`: stai derives a deterministic
+  `seed` from the diff and config, uses `base seed + group index` per group,
+  and caches results in `.git/stai-review-cache.jsonl` so repeated reviews of
+  the same diff return the same output without calling the model again;
+- Force a fresh review with `--no-cache` or `STAI_NO_CACHE=1`;
+- If a provider call fails mid-review (e.g. 1 of 6 groups times out), stai
+  prints the findings from the groups that completed, then prints the error,
+  and exits with code 1. Already-discovered issues are no longer discarded.
+- If the provider does not support `seed` (some local models), a one-time log
+  warning is emitted; disable seed sending with `review.seed = false` or turn
+  off determinism entirely with `review.deterministic = false`;
 - The review prompt embeds two core principles (precision beats recall; no
   findings deterministic tooling already surfaces) plus a condensed Go
   checklist (injected when the diff touches `.go` files); `review.rules`
@@ -160,6 +172,12 @@ Stage your changes, then run **Actions → Custom Actions → AI 审查改动**
 
 CLI equivalent: `stai review`; `stai review -strict` enables strict mode for
 this run (exit code 1 on high-severity findings, scriptable).
+
+`stai review` also supports:
+
+- `-format json [-output result.json]`: structured output `{"complete":bool,"error":string,"findings":[...]}` for CI / MCP / scripts; with `-output` the JSON goes to the file and stdout gets a one-line summary;
+- `-resume <id>`: when a group fails, session progress is recorded in `.git/stai-review-sessions.jsonl` (7-day TTL) and the failure message shows an 8-char short ID; re-running with `-resume` reviews only the remaining groups;
+- `-no-cache`, `-no-validate-locations`: skip the cache / location validation for one run.
 
 ### Branch-level helpers (M3-A/B/C)
 
@@ -307,6 +325,9 @@ report_path = ".git/stai-review.md"
 group_max_lines = 100
 concurrency = 4                                  # parallel group reviews; remote providers benefit, a local single GPU queues, 1 = serial
 suggest_fixes = true                             # ask the model for a concrete fix per finding
+deterministic = true                             # derive deterministic seed from diff+config and enable result caching
+seed = true                                      # send seed in request (provider support required)
+cache = true                                     # enable .git/stai-review-cache.jsonl local result cache
 # rules = ["every error in a new function must be logf'd or returned"]  # project-specific review rules
 # base_url = "" / api_key = "" / model = ""        # review-only model overrides; empty inherits [provider]
 # temperature = 1                                  # set when the review model only accepts temperature=1
@@ -348,7 +369,7 @@ you want English menu items.
 | `provider.base_url` | `http://localhost:11434/v1` | OpenAI-compatible endpoint (Ollama, LM Studio, gateways) |
 | `provider.api_key` | `""` | API key; empty for local models |
 | `provider.model` | `qwen2.5-coder:7b` | Model name |
-| `provider.timeout_seconds` | `120` | Per-request timeout (seconds) |
+| `provider.timeout_seconds` | `120` | Per-request timeout (seconds); for review, each group gets its own timeout, so multiple groups do not share one global countdown |
 | `provider.temperature` | `0` | Request temperature, `0` = deterministic; some models only accept `1` |
 | `commit.style` | `conventional` | Only `conventional` is supported; other values error out |
 | `commit.types` | `feat` … `ci` (10 total) | Allowed types; out-of-list output is retried, then errors |
@@ -364,7 +385,13 @@ you want English menu items.
 | `review.group_max_lines` | `100` | Changed lines above this split the diff into per-file review groups (open-code-review's grouping threshold) |
 | `review.concurrency` | `4` | Parallel group reviews; remote providers cut wall time, a local single GPU queues, `1` = serial |
 | `review.suggest_fixes` | `true` | Ask the model for a concrete fix per finding, shown on stdout and in the report file; notifications stay summary-only |
+| `review.deterministic` | `true` | `true`: derive a deterministic seed from diff+config and enable result caching for repeatable reviews |
+| `review.seed` | `true` | `true`: send a `seed` in the request; set to `false` if the provider does not support it |
+| `review.cache` | `true` | `true`: enable `.git/stai-review-cache.jsonl` local result cache |
+| `review.validate_locations` | `true` | Validate that finding locations appear in this diff; drifted file/line findings are dropped. One-off off: `stai review -no-validate-locations` |
+| `review.bundle` | `true` | Smart bundling: related files (same dir, locale suffixes like `_en`/`_zh`, test/platform suffixes) go into the same review group first (inspired by open-code-review smart bundling) |
 | `review.rules` | `[]` | Project-specific review rules appended verbatim to the review prompt |
+| `[[review.rule]]` | (none) | Path-scoped rules: `include`/`exclude` globs (slash-free patterns also match the base name); matching files get the block's rules on top of the global rules |
 | `review.base_url` / `review.api_key` / `review.model` | inherit `[provider]` | Review-only model overrides; lets review use a big model while gen stays on the fast local one |
 | `review.temperature` | inherit `provider.temperature` | Set only when the review model restricts temperature (e.g. reasoning models that accept only `1`) |
 | `hook.timeout_seconds` | `120` | Overall hook timeout (seconds) for `prepare-commit-msg`, `pre-commit` and `pre-push` |
@@ -417,13 +444,21 @@ go run ./cmd/stai help         # command help
 ## Layout
 
 ```
-cmd/stai/        CLI entrypoint and subcommands (gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor)
-internal/ai      OpenAI-compatible client; commit/PR-title/PR-description/stash/explain/split/changelog generation and staged/branch review (bilingual prompts)
+cmd/stai/        CLI entrypoint and subcommands (gen / hook / review / pr / pr-title / review-branch / stash-msg / explain / split / changelog / mergetool / install / uninstall / config / doctor / mcp)
+internal/ai      OpenAI-compatible client; commit/PR-title/PR-description/stash/explain/split/changelog generation and staged/branch review (bilingual prompts), review cache and sessions
 internal/config  layered configuration loading
 internal/git     git command wrappers (staged diff, branch diff, working-tree diff, git log, tags, hook paths)
 internal/i18n    zh/en CLI string tables and language switching
 docs/            design notes (design.md)
 ```
+
+## Security
+
+See [SECURITY.md](SECURITY.md) for the security design (config file permissions, path validation, threat model).
+
+## MCP Server
+
+`stai mcp` exposes one `review_diff` tool over stdio JSON-RPC (input: diff text or `repo_dir`; output: the same structured result as `-format json`), so MCP clients such as Claude Code or Cursor can invoke stai's review as a tool.
 
 ## Roadmap
 

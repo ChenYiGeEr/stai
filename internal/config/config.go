@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -48,6 +49,11 @@ type Review struct {
 	GroupMaxLines     int      // diff is reviewed in per-file groups whose changed lines stay under this
 	Concurrency       int      // groups reviewed in parallel; 1 = serial
 	SuggestFixes      bool     // ask the model for a concrete fix suggestion per finding
+	Deterministic     bool     // master switch: make review deterministic via seed + cache (forces both on when true)
+	Seed              bool     // send a deterministic seed to the model API
+	Cache             bool     // cache review results keyed by diff+config
+	ValidateLocations bool     // drop findings whose file/line is outside the diff
+	Bundle            bool     // bundle related files into the same review group
 	Rules             []string // project-specific rules injected into the review prompt
 	// Optional provider overrides; empty fields inherit [provider]. Lets
 	// review use a stronger model than gen while gen stays on a fast one.
@@ -55,6 +61,109 @@ type Review struct {
 	APIKey      string
 	Model       string
 	Temperature *float64 // nil inherits provider.temperature (some models only accept 1)
+
+	// RuleSets are path-scoped rule blocks from [[review.rule]] tables.
+	// Rules listed here are ADDED to Rules for matching files; global Rules
+	// always apply. See RulesForPath.
+	RuleSets []ReviewRule
+}
+
+// ReviewRule is one [[review.rule]] block: when a file path matches any
+// include pattern (and no exclude pattern), its rules are appended to the
+// prompt for the review group containing that file.
+type ReviewRule struct {
+	Include []string // glob patterns; empty means "match every file"
+	Exclude []string // glob patterns; a match skips this rule set
+	Rules   []string // rules appended for matching files
+}
+
+// RulesForPath returns the deduplicated rules that apply to path: the
+// global Rules always, plus the rules of every matching RuleSet. An invalid
+// glob pattern in a rule set is reported as an error.
+func (r Review) RulesForPath(p string) ([]string, error) {
+	return MatchRules(r.Rules, r.RuleSets, p)
+}
+
+// MatchRules returns the deduplicated rules for path: the global rules
+// always, plus the rules of every rule set whose globs match the path.
+// It is exported so the ai package can apply the same matching when a
+// review group is assembled from several files. An invalid glob pattern
+// aborts with an error instead of silently not matching.
+func MatchRules(rules []string, sets []ReviewRule, p string) ([]string, error) {
+	out := make([]string, 0, len(rules)+4)
+	out = append(out, rules...)
+	seen := make(map[string]bool, len(out))
+	for _, s := range out {
+		seen[s] = true
+	}
+	for _, rs := range sets {
+		ok, err := rs.matches(p)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		for _, rule := range rs.Rules {
+			if !seen[rule] {
+				seen[rule] = true
+				out = append(out, rule)
+			}
+		}
+	}
+	return out, nil
+}
+
+// matches reports whether path satisfies this rule's include/exclude globs.
+// A pattern without "/" also matches against the file's base name, so
+// "*.go" matches "src/a.go". Matching uses slash-separated paths. An
+// unparsable glob pattern is returned as an error.
+func (rs ReviewRule) matches(p string) (bool, error) {
+	if len(rs.Exclude) > 0 {
+		for _, ex := range rs.Exclude {
+			ok, err := globMatch(ex, p)
+			if err != nil {
+				return false, fmt.Errorf("review.rule exclude %q: %w", ex, err)
+			}
+			if ok {
+				return false, nil
+			}
+		}
+	}
+	if len(rs.Include) == 0 {
+		return true, nil
+	}
+	for _, inc := range rs.Include {
+		ok, err := globMatch(inc, p)
+		if err != nil {
+			return false, fmt.Errorf("review.rule include %q: %w", inc, err)
+		}
+		if ok {
+			return true, nil
+		}
+	}
+	return false, nil
+}
+
+// globMatch matches pattern against the full path and, when the pattern has
+// no slash, against the base name too (so "*.go" matches "src/a.go").
+// A malformed pattern is surfaced as an error rather than a silent no-match.
+func globMatch(pattern, p string) (bool, error) {
+	ok, err := path.Match(pattern, p)
+	if err != nil {
+		return false, err
+	}
+	if ok {
+		return true, nil
+	}
+	if !strings.Contains(pattern, "/") {
+		ok, err := path.Match(pattern, path.Base(p))
+		if err != nil {
+			return false, err
+		}
+		return ok, nil
+	}
+	return false, nil
 }
 
 type PrePush struct {
@@ -141,6 +250,11 @@ func Default() Config {
 			GroupMaxLines:     100,
 			Concurrency:       4,
 			SuggestFixes:      true,
+			Deterministic:     true,
+			Seed:              true,
+			Cache:             true,
+			ValidateLocations: true,
+			Bundle:            true,
 		},
 		PrePush: PrePush{
 			BaseRef: "origin/main",
@@ -227,6 +341,15 @@ func (cfg Config) validate() error {
 	if cfg.PrePush.BaseRef == "" {
 		return errors.New("pre_push.base_ref must not be empty")
 	}
+	// Fail fast on unparsable [[review.rule]] globs instead of silently
+	// never matching at review time.
+	for _, rs := range cfg.Review.RuleSets {
+		for _, pattern := range append(append([]string{}, rs.Include...), rs.Exclude...) {
+			if _, err := path.Match(pattern, "probe"); err != nil {
+				return fmt.Errorf("review.rule pattern %q: %w", pattern, err)
+			}
+		}
+	}
 	return nil
 }
 
@@ -243,12 +366,36 @@ func applyEnv(cfg *Config) {
 	if v := os.Getenv("STAI_MODEL"); v != "" {
 		cfg.Provider.Model = v
 	}
+	if v := os.Getenv("STAI_REVIEW_DETERMINISTIC"); v != "" {
+		cfg.Review.Deterministic = v == "1" || strings.EqualFold(v, "true")
+	}
+	// Deterministic mode requires seed + cache; force them on unless an
+	// explicit per-feature env var disables them below.
+	if cfg.Review.Deterministic {
+		cfg.Review.Seed = true
+		cfg.Review.Cache = true
+	}
+	if v := os.Getenv("STAI_REVIEW_SEED"); v != "" {
+		cfg.Review.Seed = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("STAI_REVIEW_CACHE"); v != "" {
+		cfg.Review.Cache = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("STAI_NO_CACHE"); v != "" {
+		cfg.Review.Cache = !(v == "1" || strings.EqualFold(v, "true"))
+	}
+	if v := os.Getenv("STAI_REVIEW_VALIDATE_LOCATIONS"); v != "" {
+		cfg.Review.ValidateLocations = v == "1" || strings.EqualFold(v, "true")
+	}
+	if v := os.Getenv("STAI_REVIEW_BUNDLE"); v != "" {
+		cfg.Review.Bundle = v == "1" || strings.EqualFold(v, "true")
+	}
 }
 
-// loadFile parses a minimal TOML subset: [section] headers, scalar
-// key = value pairs (strings, integers, booleans), single-line arrays of
-// strings, # comments. That covers every config stai defines without
-// pulling in a TOML dependency.
+// loadFile parses a minimal TOML subset: [section] headers, [[review.rule]]
+// array-of-table headers, scalar key = value pairs (strings, integers,
+// booleans), single-line arrays of strings, # comments. That covers every
+// config stai defines without pulling in a TOML dependency.
 func loadFile(cfg *Config, path string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -264,6 +411,14 @@ func loadFile(cfg *Config, path string) error {
 		if line == "" {
 			continue
 		}
+		if strings.HasPrefix(line, "[[") && strings.HasSuffix(line, "]]") {
+			section = strings.TrimSpace(line[2 : len(line)-2])
+			if section != "review.rule" {
+				return fmt.Errorf("%s:%d: unsupported table [[%s]] (only [[review.rule]])", path, lineNo, section)
+			}
+			cfg.Review.RuleSets = append(cfg.Review.RuleSets, ReviewRule{})
+			continue
+		}
 		if strings.HasPrefix(line, "[") && strings.HasSuffix(line, "]") {
 			section = strings.TrimSpace(line[1 : len(line)-1])
 			continue
@@ -272,7 +427,18 @@ func loadFile(cfg *Config, path string) error {
 		if !ok {
 			return fmt.Errorf("%s:%d: expected key = value", path, lineNo)
 		}
-		if err := set(cfg, section, strings.TrimSpace(key), strings.TrimSpace(val)); err != nil {
+		key = strings.TrimSpace(key)
+		val = strings.TrimSpace(val)
+		if section == "review.rule" {
+			if len(cfg.Review.RuleSets) == 0 {
+				return fmt.Errorf("%s:%d: key %q before any [[review.rule]] header", path, lineNo, key)
+			}
+			if err := setRule(&cfg.Review.RuleSets[len(cfg.Review.RuleSets)-1], key, val); err != nil {
+				return fmt.Errorf("%s:%d: %w", path, lineNo, err)
+			}
+			continue
+		}
+		if err := set(cfg, section, key, val); err != nil {
 			return fmt.Errorf("%s:%d: %w", path, lineNo, err)
 		}
 	}
@@ -344,6 +510,16 @@ func set(cfg *Config, section, key, raw string) error {
 		err = setInt(raw, &cfg.Review.Concurrency)
 	case "review.suggest_fixes":
 		err = setBool(raw, &cfg.Review.SuggestFixes)
+	case "review.deterministic":
+		err = setBool(raw, &cfg.Review.Deterministic)
+	case "review.seed":
+		err = setBool(raw, &cfg.Review.Seed)
+	case "review.cache":
+		err = setBool(raw, &cfg.Review.Cache)
+	case "review.validate_locations":
+		err = setBool(raw, &cfg.Review.ValidateLocations)
+	case "review.bundle":
+		err = setBool(raw, &cfg.Review.Bundle)
 	case "review.rules":
 		err = setStrings(raw, &cfg.Review.Rules)
 	case "review.base_url":
@@ -419,6 +595,25 @@ func set(cfg *Config, section, key, raw string) error {
 		}
 	default:
 		return fmt.Errorf("unknown key %q in section [%s]", key, section)
+	}
+	if err != nil {
+		return fmt.Errorf("%s: %w", key, err)
+	}
+	return nil
+}
+
+// setRule parses one key inside a [[review.rule]] table.
+func setRule(rs *ReviewRule, key, raw string) error {
+	var err error
+	switch key {
+	case "include":
+		err = setStrings(raw, &rs.Include)
+	case "exclude":
+		err = setStrings(raw, &rs.Exclude)
+	case "rules":
+		err = setStrings(raw, &rs.Rules)
+	default:
+		return fmt.Errorf("unknown key %q in [[review.rule]]", key)
 	}
 	if err != nil {
 		return fmt.Errorf("%s: %w", key, err)
@@ -533,7 +728,12 @@ func BackupGlobal() error {
 	if err != nil {
 		return err
 	}
-	return os.WriteFile(path+".bak", data, 0o600)
+	if err := os.WriteFile(path+".bak", data, 0o600); err != nil {
+		return err
+	}
+	// os.WriteFile does not change the mode of an existing file; tighten it
+	// explicitly so backups never leak wider permissions.
+	return os.Chmod(path+".bak", 0o600)
 }
 
 // WriteGlobal writes a fresh, fully-commented config file for the user.
@@ -560,7 +760,29 @@ func WriteGlobal(cfg Config, lang string) error {
 		cfg.Provider.APIKey,
 		cfg.Provider.Model,
 	)
-	return os.WriteFile(path, []byte(content), 0o600)
+	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+		return err
+	}
+	// os.WriteFile does not change the mode of an existing file; tighten it
+	// explicitly so an insecure pre-existing config is hardened on rewrite.
+	return os.Chmod(path, 0o600)
+}
+
+// FileInsecure reports whether the global config file exists and has
+// permission bits beyond the owner (i.e. group or others can read it).
+// It returns false when the file does not exist or the home directory
+// cannot be determined.
+func FileInsecure() (bool, os.FileMode) {
+	path := GlobalPath()
+	if path == "" {
+		return false, 0
+	}
+	info, err := os.Stat(path)
+	if err != nil {
+		return false, 0
+	}
+	perm := info.Mode().Perm()
+	return perm&0o077 != 0, perm
 }
 
 const configTemplateZH = `# stai 配置文件
@@ -613,8 +835,23 @@ model = %q
 # concurrency = 4
 # 是否要求模型给出具体修改建议
 # suggest_fixes = true
+# 是否让 review 结果可复现:发送确定性 seed 并缓存结果
+# deterministic = true
+# 是否在请求中发送 seed(需 provider 支持)
+# seed = true
+# 是否启用本地结果缓存
+# cache = true
+# 是否校验审查结果中的文件/行号确实出现在本次 diff 中,丢弃漂移的 location
+# validate_locations = true
+# 是否把相关文件(同目录/本地化后缀/测试文件等)优先分到同一审查组
+# bundle = true
 # 项目自定义审查规则(字符串数组)
 # rules = []
+# 按路径追加规则;include 命中的文件在全局 rules 之外额外收到这些规则
+# [[review.rule]]
+# include = ["*.go"]
+# exclude = ["*_test.go"]
+# rules = ["检查 err 是否被正确处理"]
 # 以下三项若设置,则 review 使用独立模型/地址/密钥
 # base_url = ""
 # api_key = ""
@@ -720,8 +957,23 @@ model = %q
 # concurrency = 4
 # Ask the model for a concrete fix suggestion per finding
 # suggest_fixes = true
+# Make review results reproducible: send a deterministic seed and cache results
+# deterministic = true
+# Send a seed in the request (provider support required)
+# seed = true
+# Enable local result cache
+# cache = true
+# Drop findings whose file/line does not appear in this diff
+# validate_locations = true
+# Bundle related files (same dir/locale suffix/test files) into one group
+# bundle = true
 # Project-specific review rules (array of strings)
 # rules = []
+# Path-scoped rules; matching files get these on top of the global rules
+# [[review.rule]]
+# include = ["*.go"]
+# exclude = ["*_test.go"]
+# rules = ["check that errors are handled correctly"]
 # If set, review uses a separate endpoint/key/model
 # base_url = ""
 # api_key = ""

@@ -8,15 +8,19 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
+	"path"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode"
 	"unicode/utf8"
@@ -36,13 +40,14 @@ func SetLang(l string) { lang = l }
 func langIsEnglish() bool { return lang == "en" }
 
 type Client struct {
-	baseURL     string
-	apiKey      string
-	model       string
-	http        *http.Client
-	sessionID   string                           // one per run, so providers can group a conversation
-	Temperature float64                          // request temperature; 0 = deterministic. Some models only accept 1 — set it via config.
-	Logf        func(format string, args ...any) // optional debug log; nil means silent
+	baseURL      string
+	apiKey       string
+	model        string
+	http         *http.Client
+	sessionID    string                           // one per run, so providers can group a conversation
+	Temperature  float64                          // request temperature; 0 = deterministic. Some models only accept 1 — set it via config.
+	Logf         func(format string, args ...any) // optional debug log; nil means silent
+	seedWarnOnce sync.Once                        // warns once per run if the provider ignores seed
 }
 
 func NewClient(baseURL, apiKey, model string, timeout time.Duration) *Client {
@@ -67,13 +72,16 @@ type chatRequest struct {
 	Messages    []chatMessage `json:"messages"`
 	Temperature float64       `json:"temperature"`
 	Stream      bool          `json:"stream"`
+	Seed        *int64        `json:"seed,omitempty"`
 }
 
 type chatResponse struct {
 	Choices []struct {
 		Message chatMessage `json:"message"`
 	} `json:"choices"`
-	Error *struct {
+	SystemFingerprint string `json:"system_fingerprint"`
+	Seed              int64  `json:"seed"`
+	Error             *struct {
 		Message string `json:"message"`
 	} `json:"error"`
 }
@@ -83,15 +91,16 @@ func (c *Client) Chat(ctx context.Context, system, user string) (string, error) 
 	return c.chat(ctx, []chatMessage{
 		{Role: "system", Content: system},
 		{Role: "user", Content: user},
-	})
+	}, nil)
 }
 
-func (c *Client) chat(ctx context.Context, messages []chatMessage) (string, error) {
+func (c *Client) chat(ctx context.Context, messages []chatMessage, seed *int64) (string, error) {
 	body, err := json.Marshal(chatRequest{
 		Model:       c.model,
 		Messages:    messages,
 		Temperature: c.Temperature,
 		Stream:      false,
+		Seed:        seed,
 	})
 	if err != nil {
 		return "", err
@@ -130,10 +139,21 @@ func (c *Client) chat(ctx context.Context, messages []chatMessage) (string, erro
 	if out.Error != nil && out.Error.Message != "" {
 		return "", fmt.Errorf("provider error: %s", out.Error.Message)
 	}
+	if seed != nil && *seed != 0 && out.Seed == 0 {
+		c.warnSeedIgnored()
+	}
 	if len(out.Choices) == 0 || strings.TrimSpace(out.Choices[0].Message.Content) == "" {
 		return "", fmt.Errorf("provider returned an empty completion")
 	}
 	return out.Choices[0].Message.Content, nil
+}
+
+func (c *Client) warnSeedIgnored() {
+	c.seedWarnOnce.Do(func() {
+		if c.Logf != nil {
+			c.Logf("review warning: provider did not echo seed; deterministic output cannot be guaranteed")
+		}
+	})
 }
 
 // GenerateCommit asks the model for a commit message for the given diff and
@@ -156,7 +176,7 @@ func (c *Client) GenerateCommit(ctx context.Context, cfg config.Commit, diff []b
 			diffStatsLine(files, changedLines), commitUserLead(), body, truncated)},
 	}
 
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -168,7 +188,7 @@ func (c *Client) GenerateCommit(ctx context.Context, cfg config.Commit, diff []b
 			chatMessage{Role: "assistant", Content: raw},
 			chatMessage{Role: "user", Content: fmt.Sprintf(commitRetryLead(), reason)},
 		)
-		raw, err = c.chat(ctx, messages)
+		raw, err = c.chat(ctx, messages, nil)
 		if err != nil {
 			return "", err
 		}
@@ -213,7 +233,7 @@ func (c *Client) GeneratePR(ctx context.Context, cfg config.Commit, diff []byte)
 			diffStatsLine(files, changedLines), prUserLead(), diffBody, truncated)},
 	}
 
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", "", err
 	}
@@ -224,7 +244,7 @@ func (c *Client) GeneratePR(ctx context.Context, cfg config.Commit, diff []byte)
 			chatMessage{Role: "assistant", Content: raw},
 			chatMessage{Role: "user", Content: fmt.Sprintf(prRetryLead(), reason)},
 		)
-		raw, err = c.chat(ctx, messages)
+		raw, err = c.chat(ctx, messages, nil)
 		if err != nil {
 			return "", "", err
 		}
@@ -314,7 +334,7 @@ func (c *Client) GenerateStashMsg(ctx context.Context, cfg config.Commit, diff [
 		{Role: "user", Content: fmt.Sprintf("%s\n\n%s\n\n%s%s",
 			diffStatsLine(files, changedLines), stashUserLead(), body, truncated)},
 	}
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -352,14 +372,26 @@ func HasHigh(findings []Finding) bool {
 
 // ReviewParams carries everything GenerateReview needs.
 type ReviewParams struct {
-	Diff          []byte
-	MaxChars      int                              // truncate each group beyond this, telling the model
-	Retries       int                              // parse-retry count per group (0 = validate the first reply only)
-	GroupMaxLines int                              // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
-	Concurrency   int                              // groups reviewed in parallel; <= 1 = serial
-	Rules         []string                         // project-specific rules appended to the review prompt
-	SuggestFixes  bool                             // ask the model for a concrete fix suggestion per finding
-	Logf          func(format string, args ...any) // optional per-group progress log
+	Diff              []byte
+	MaxChars          int                              // truncate each group beyond this, telling the model
+	Retries           int                              // parse-retry count per group (0 = validate the first reply only)
+	GroupMaxLines     int                              // diff is split into per-file groups whose combined changed lines stay under this; <= 0 = single group
+	Concurrency       int                              // groups reviewed in parallel; <= 1 = serial
+	Timeout           int                              // per-group timeout in seconds; <= 0 falls back to the http client timeout
+	Rules             []string                         // project-specific rules appended to the review prompt
+	RuleSets          []config.ReviewRule              // path-scoped rules; each group gets the union for its files
+	Bundle            bool                             // bundle related files into the same review group before size-splitting
+	SuggestFixes      bool                             // ask the model for a concrete fix suggestion per finding
+	Strict            bool                             // whether the review runs in strict mode (affects cache key)
+	Deterministic     bool                             // use a deterministic seed and cache results
+	Seed              bool                             // send a seed to the model API
+	Cache             bool                             // enable local result cache
+	NoCache           bool                             // bypass the local cache for this run
+	SessionPath       string                           // path to the repo-local session file ("" disables session recording)
+	ResumeID          string                           // short/full session id to resume; "" starts fresh
+	ValidateLocations bool                             // drop findings whose file/line is outside the diff
+	CachePath         string                           // path to the repo-local cache file
+	Logf              func(format string, args ...any) // optional per-group progress log
 }
 
 var reviewFinding = regexp.MustCompile(`(?i)^\[(high|medium|low)\]\s*([^\s]+)\s*-\s*(.+)$`)
@@ -378,28 +410,373 @@ var reviewFinding = regexp.MustCompile(`(?i)^\[(high|medium|low)\]\s*([^\s]+)\s*
 // them when shown one file at a time. Findings from all groups are merged
 // and sorted high → low.
 func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding, error) {
-	groups := groupDiff(p.Diff, p.GroupMaxLines)
-	if p.Concurrency > 1 && len(groups) > 1 {
-		return c.reviewGroupsParallel(ctx, p, groups)
+	baseSeed := c.reviewBaseSeed(p)
+	var ranges map[string][][2]int
+	if p.ValidateLocations {
+		ranges = parseDiffRanges(p.Diff)
 	}
-	var all []Finding
-	for i, g := range groups {
-		findings, err := c.reviewGroup(ctx, p, g, i+1, len(groups))
-		if err != nil {
-			return nil, err
+	if p.Cache && p.CachePath != "" && !p.NoCache {
+		if cached := c.loadCachedReview(p); cached != nil {
+			if p.Logf != nil {
+				p.Logf("review cache hit key=%s findings=%d", c.reviewCacheKey(p), len(cached))
+			}
+			// A complete cached review makes any stale session for the same
+			// diff/config unrecoverable; drop it so --resume does not offer a
+			// session that would be skipped on the next run anyway.
+			if p.SessionPath != "" {
+				if err := DeleteReviewSession(p.SessionPath, c.reviewCacheKey(p)); err != nil && p.Logf != nil {
+					p.Logf("review cache hit: stale session cleanup failed: %v", err)
+				}
+			}
+			return c.filterValidLocations(p, cached, ranges), nil
 		}
-		all = append(all, findings...)
 	}
-	sortFindings(all)
+
+	// Session resume: --resume <short-id> picks up a previously interrupted
+	// run. The session must match the current diff/config (same cache key),
+	// otherwise the review would silently mix results from different diffs.
+	var key string
+	var prev []Finding
+	done := map[int]bool{}
+	resumed := false
+	if p.SessionPath != "" {
+		key = c.reviewCacheKey(p)
+		if p.ResumeID != "" {
+			s, serr := FindReviewSession(p.SessionPath, p.ResumeID)
+			if serr != nil {
+				return nil, serr
+			}
+			if s.ID != key {
+				return nil, fmt.Errorf("session %s does not match the current diff/config; re-run without --resume", p.ResumeID)
+			}
+			resumed = true
+			prev = append(prev, s.Findings...)
+			for _, n := range s.CompletedGroups {
+				done[n] = true
+			}
+		}
+	}
+
+	groups := groupDiff(reorderDiff(p.Diff, p.Bundle), p.GroupMaxLines)
+	if p.Logf != nil {
+		p.Logf("review start groups=%d temperature=%v deterministic=%v seed=%v cache=%v base_seed=%d resumed=%v completed=%d",
+			len(groups), c.Temperature, p.Deterministic, p.Seed, p.Cache, baseSeed, resumed, len(done))
+	}
+
+	var all []Finding
+	all = append(all, prev...)
+	var err error
+	groupTimeout := time.Duration(p.Timeout) * time.Second
+
+	// Session progress shared by both modes: done marks completed group
+	// numbers (guarded by mu) and sessionFindings accumulates their
+	// findings. Every completed group is persisted immediately, so an
+	// interrupted run — parallel or serial — keeps its progress for
+	// --resume.
+	var mu sync.Mutex
+	sessionFindings := append([]Finding{}, prev...)
+	record := func(groupNum int, groupFindings []Finding) {
+		mu.Lock()
+		done[groupNum] = true
+		sessionFindings = append(sessionFindings, groupFindings...)
+		completedSnap := sortedDoneKeys(done)
+		findingsSnap := append([]Finding{}, sessionFindings...)
+		mu.Unlock()
+		c.saveSessionSnapshot(p, key, completedSnap, len(groups), findingsSnap, "")
+	}
+
+	if p.Concurrency > 1 && len(groups) > 1 {
+		// Append, don't overwrite: all already carries the resumed session's
+		// findings (prev); clobbering it would drop them from the output.
+		var fresh []Finding
+		fresh, err = c.reviewGroupsParallel(ctx, p, groups, baseSeed, groupTimeout, done, &mu, record)
+		all = append(all, fresh...)
+	} else {
+		for i, g := range groups {
+			mu.Lock()
+			skip := done[i+1]
+			mu.Unlock()
+			if skip {
+				if p.Logf != nil {
+					p.Logf("review group %d/%d skipped (completed in resumed session)", i+1, len(groups))
+				}
+				continue
+			}
+			groupCtx, cancel := c.groupContext(ctx, groupTimeout)
+			var findings []Finding
+			findings, err = c.reviewGroup(groupCtx, p, g, i+1, len(groups), groupSeed(baseSeed, i))
+			cancel()
+			if err != nil {
+				break
+			}
+			all = append(all, findings...)
+			record(i+1, findings)
+		}
+	}
+	all = c.filterValidLocations(p, all, ranges)
+	if len(all) > 0 {
+		sortFindings(all)
+	}
+	if err != nil {
+		mu.Lock()
+		completedSnap := sortedDoneKeys(done)
+		findingsSnap := append([]Finding{}, sessionFindings...)
+		nDone := len(done)
+		mu.Unlock()
+		if serr := c.saveSessionSnapshot(p, key, completedSnap, len(groups), findingsSnap, err.Error()); serr == nil && p.SessionPath != "" && key != "" && nDone > 0 {
+			err = fmt.Errorf("%w\n%s", err, fmt.Sprintf(i18n.T("review_resume_hint"), ShortSessionID(key)))
+		}
+		return all, err
+	}
+
+	// A successful run closes out any session left over from a failed run
+	// with the same diff/config.
+	if p.SessionPath != "" {
+		if derr := DeleteReviewSession(p.SessionPath, key); derr != nil && p.Logf != nil {
+			p.Logf("review session delete failed: %v", derr)
+		}
+	}
+
+	if p.Cache && p.CachePath != "" && !p.NoCache {
+		if err := c.saveCachedReview(p, all); err != nil && p.Logf != nil {
+			p.Logf("review cache save failed: %v", err)
+		}
+	}
 	return all, nil
+}
+
+// reviewBaseSeed returns a deterministic base seed for the whole review run.
+// It is zero when deterministic mode is disabled; callers then pass nil seeds.
+// The seed is constrained to a positive 32-bit range because several
+// OpenAI-compatible providers (e.g. DashScope) reject larger integer values.
+func (c *Client) reviewBaseSeed(p ReviewParams) int64 {
+	if !p.Deterministic || !p.Seed {
+		return 0
+	}
+	h := sha256.New()
+	h.Write(p.Diff)
+	fmt.Fprintf(h, "|%s|%s|%v|%v|%v|%s|%s|%v|%v|%s|%v",
+		c.model, c.baseURL, c.Temperature, p.SuggestFixes, p.Strict,
+		strings.Join(p.Rules, "\x00"), lang, p.Deterministic, p.Seed, ruleSetKey(p.RuleSets), p.Bundle)
+	var n uint32
+	sum := h.Sum(nil)
+	for i := 0; i < 4; i++ {
+		n = (n << 8) | uint32(sum[i])
+	}
+	// Avoid 0 because we use it as the "no seed" sentinel.
+	if n == 0 {
+		n = 1
+	}
+	return int64(n)
+}
+
+func groupSeed(base int64, idx int) *int64 {
+	if base == 0 {
+		return nil
+	}
+	s := ((base + int64(idx) - 1) % 0x7fffffff) + 1
+	if s == 0 {
+		s = 1
+	}
+	return &s
+}
+
+// ruleSetKey renders rule sets in a stable form for seed/cache keys.
+func ruleSetKey(sets []config.ReviewRule) string {
+	if len(sets) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	for _, rs := range sets {
+		fmt.Fprintf(&b, "i:%s|x:%s|r:%s;",
+			strings.Join(rs.Include, ","), strings.Join(rs.Exclude, ","), strings.Join(rs.Rules, "\x00"))
+	}
+	return b.String()
+}
+
+// bundleSuffixRe strips locale/platform/test suffixes so related files
+// (message_en.properties + message_zh.properties, foo.go + foo_test.go,
+// term_darwin.go + term_linux.go) share one bundle key.
+var bundleSuffixRe = regexp.MustCompile(
+	`_(en|zh(-[A-Za-z]{2,4})?|ja|ko|ru|fr|de|es|it|pt|da|de|fr|darwin|linux|windows|test|spec)$`)
+
+// reorderDiff reorders a diff's per-file chunks so related files are
+// adjacent; groupDiff then naturally packs them into the same group.
+// With bundle=false (or a single-file diff) the input is returned as-is.
+func reorderDiff(diff []byte, bundle bool) []byte {
+	if !bundle {
+		return diff
+	}
+	chunks := splitDiffFiles(diff)
+	if len(chunks) <= 1 {
+		return diff
+	}
+	type keyed struct {
+		key   string
+		order int
+	}
+	keys := make([]keyed, len(chunks))
+	for i, ch := range chunks {
+		keys[i] = keyed{bundleKey(diffFilePaths(ch)), i}
+	}
+	sort.SliceStable(keys, func(a, b int) bool { return keys[a].key < keys[b].key })
+	var out bytes.Buffer
+	for _, k := range keys {
+		out.Write(chunks[k.order])
+	}
+	return out.Bytes()
+}
+
+// bundleKey derives the bundling key from a chunk's file paths: files in
+// the same directory whose names share a stripped base and extension are
+// related. A chunk with no parseable path (e.g. the diff preamble) sorts
+// first.
+func bundleKey(paths []string) string {
+	if len(paths) == 0 {
+		return "\x00\x00"
+	}
+	p := paths[0]
+	dir, base := path.Split(p)
+	ext := path.Ext(base)
+	stem := strings.TrimSuffix(base, ext)
+	stem = bundleSuffixRe.ReplaceAllString(stem, "")
+	return dir + "\x00" + stem + ext
+}
+
+// diffFilePaths lists the new-file paths a diff chunk touches (the
+// "+++ b/<path>" headers); deleted files ("/dev/null") are skipped.
+func diffFilePaths(chunk []byte) []string {
+	var out []string
+	for _, line := range strings.Split(string(chunk), "\n") {
+		if !strings.HasPrefix(line, "+++ ") {
+			continue
+		}
+		p := strings.TrimPrefix(strings.TrimSpace(line), "+++ ")
+		p = strings.TrimPrefix(p, "b/")
+		if p == "/dev/null" || p == "" {
+			continue
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// groupRules returns the rules for one review group: the global rules plus
+// the path-scoped rules of every file the group touches, deduplicated. An
+// invalid glob in a rule set is logged (via Logf) and that set is skipped —
+// config load already rejects malformed patterns, so this only guards
+// against programmatically built params.
+func groupRules(p ReviewParams, group []byte) []string {
+	if len(p.RuleSets) == 0 {
+		return p.Rules
+	}
+	seen := make(map[string]bool, len(p.Rules)+4)
+	var out []string
+	add := func(rules []string) {
+		for _, r := range rules {
+			if !seen[r] {
+				seen[r] = true
+				out = append(out, r)
+			}
+		}
+	}
+	add(p.Rules)
+	for _, path := range diffFilePaths(group) {
+		rules, err := config.MatchRules(nil, p.RuleSets, path)
+		if err != nil {
+			if p.Logf != nil {
+				p.Logf("review rule matching skipped for %s: %v", path, err)
+			}
+			continue
+		}
+		add(rules)
+	}
+	return out
+}
+
+func (c *Client) reviewCacheKey(p ReviewParams) string {
+	return MakeReviewCacheKey(p.Diff, c.model, c.baseURL, c.Temperature, p.Rules, p.SuggestFixes, p.Strict, lang, p.Deterministic, p.Seed, p.GroupMaxLines, p.MaxChars, p.ValidateLocations, p.RuleSets, p.Bundle)
+}
+
+func (c *Client) loadCachedReview(p ReviewParams) []Finding {
+	entries, err := LoadReviewCache(p.CachePath)
+	if err != nil {
+		if p.Logf != nil {
+			p.Logf("review cache load failed: %v", err)
+		}
+		return nil
+	}
+	return FindCachedReview(entries, c.reviewCacheKey(p))
+}
+
+func (c *Client) saveCachedReview(p ReviewParams, findings []Finding) error {
+	entries, err := LoadReviewCache(p.CachePath)
+	if err != nil {
+		return err
+	}
+	entries = append(entries, reviewCacheEntry{
+		Key:       c.reviewCacheKey(p),
+		Findings:  findings,
+		Timestamp: time.Now(),
+	})
+	entries = CompactReviewCache(entries)
+	return SaveReviewCache(p.CachePath, entries)
+}
+
+// groupContext returns a context for a single review group. If timeout is
+// positive, the returned context has that deadline; otherwise the parent
+// context is returned unchanged. The caller must call cancel.
+func (c *Client) groupContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout > 0 {
+		return context.WithTimeout(parent, timeout)
+	}
+	return context.WithCancel(parent)
+}
+
+// saveSessionSnapshot persists review progress so an interrupted run can be
+// resumed. A run with no completed groups records nothing (nothing to
+// resume from); a successful run deletes its session instead. Callers
+// snapshot the done set and findings under their own lock before calling.
+// It returns the save error, or nil when nothing needed saving.
+func (c *Client) saveSessionSnapshot(p ReviewParams, key string, completed []int, total int, findings []Finding, runErr string) error {
+	if p.SessionPath == "" || key == "" || len(completed) == 0 {
+		return nil
+	}
+	entry := reviewSession{
+		ID:              key,
+		Timestamp:       time.Now(),
+		CompletedGroups: completed,
+		TotalGroups:     total,
+		Findings:        findings,
+		Error:           runErr,
+	}
+	if err := UpsertReviewSession(p.SessionPath, entry); err != nil {
+		if p.Logf != nil {
+			p.Logf("review session save failed: %v", err)
+		}
+		return err
+	}
+	return nil
+}
+
+// sortedDoneKeys returns the completed group numbers in ascending order.
+func sortedDoneKeys(done map[int]bool) []int {
+	out := make([]int, 0, len(done))
+	for n := range done {
+		out = append(out, n)
+	}
+	sort.Ints(out)
+	return out
 }
 
 // reviewGroupsParallel reviews the groups through a worker pool. Local
 // single-GPU models mostly queue concurrent requests (no speedup, no harm);
 // remote providers run truly in parallel, cutting wall time by the worker
-// count. The first error that occurs cancels everything still queued or in
-// flight (fast-fail, matching the serial mode) and is returned.
-func (c *Client) reviewGroupsParallel(ctx context.Context, p ReviewParams, groups [][]byte) ([]Finding, error) {
+// count. Groups already in done (a resumed session) are skipped. The first
+// error cancels everything still queued or in flight (fast-fail, matching
+// the serial mode) and is returned; every group that completes calls record
+// so session progress survives an interruption.
+func (c *Client) reviewGroupsParallel(ctx context.Context, p ReviewParams, groups [][]byte, baseSeed int64, groupTimeout time.Duration, done map[int]bool, mu *sync.Mutex, record func(groupNum int, findings []Finding)) ([]Finding, error) {
 	workers := p.Concurrency
 	if workers > len(groups) {
 		workers = len(groups)
@@ -409,49 +786,71 @@ func (c *Client) reviewGroupsParallel(ctx context.Context, p ReviewParams, group
 	results := make([][]Finding, len(groups))
 	sem := make(chan struct{}, workers)
 	var wg sync.WaitGroup
-	var errMu sync.Mutex
-	var firstErr error
+	var firstErr atomic.Pointer[error]
 	for i, g := range groups {
 		wg.Add(1)
 		go func(i int, g []byte) {
 			defer wg.Done()
+			mu.Lock()
+			skip := done[i+1]
+			mu.Unlock()
+			if skip {
+				if p.Logf != nil {
+					p.Logf("review group %d/%d skipped (completed in resumed session)", i+1, len(groups))
+				}
+				return
+			}
 			select {
 			case sem <- struct{}{}:
 			case <-ctx.Done(): // a sibling failed before this group started
 				return
 			}
 			defer func() { <-sem }()
-			findings, err := c.reviewGroup(ctx, p, g, i+1, len(groups))
+			groupCtx, groupCancel := c.groupContext(ctx, groupTimeout)
+			defer groupCancel()
+			findings, err := c.reviewGroup(groupCtx, p, g, i+1, len(groups), groupSeed(baseSeed, i))
 			results[i] = findings
 			if err != nil {
-				errMu.Lock()
-				if firstErr == nil {
-					firstErr = err
-				}
-				errMu.Unlock()
+				e := err
+				firstErr.CompareAndSwap(nil, &e)
 				cancel()
+				return
+			}
+			if record != nil {
+				record(i+1, findings)
 			}
 		}(i, g)
 	}
 	wg.Wait()
-	if firstErr != nil {
-		return nil, firstErr
-	}
+
+	// Collect findings from groups that completed successfully, even if another
+	// group failed. This lets callers show the user what was found before the
+	// error occurred.
 	var all []Finding
 	for _, findings := range results {
 		all = append(all, findings...)
 	}
-	sortFindings(all)
-	return all, nil
+	var err error
+	if e := firstErr.Load(); e != nil {
+		err = *e
+	}
+	return all, err
 }
 
 // reviewGroup reviews one diff group (a single call, with parse retries).
-func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, num, total int) (findings []Finding, err error) {
+func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, num, total int, seed *int64) (findings []Finding, err error) {
 	started := time.Now()
+	if p.Logf != nil {
+		p.Logf("review group %d/%d start chars=%d", num, total, len(group))
+	}
 	defer func() {
 		if p.Logf != nil {
-			p.Logf("review group %d/%d done findings=%d elapsed=%s",
-				num, total, len(findings), time.Since(started).Round(time.Millisecond))
+			status := "done"
+			if err != nil {
+				status = "failed"
+			}
+			p.Logf("review group %d/%d %s findings=%d elapsed=%s error=%v",
+				num, total, status, len(findings), time.Since(started).Round(time.Millisecond), err)
 		}
 	}()
 	diff := string(group)
@@ -470,13 +869,13 @@ func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, 
 		}
 	}
 	messages := []chatMessage{
-		{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group), p.SuggestFixes)},
+		{Role: "system", Content: reviewPrompt(groupRules(p, group), hasGoFiles(group), p.SuggestFixes)},
 		{Role: "user", Content: fmt.Sprintf("%s%s\n\n%s%s", prefix, reviewUserLead(), diff, truncated)},
 	}
 
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, seed)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("group %d/%d: %w", num, total, err)
 	}
 	findings, bad := parseReview(raw)
 
@@ -486,13 +885,13 @@ func (c *Client) reviewGroup(ctx context.Context, p ReviewParams, group []byte, 
 		// to reproduce the findings) instead of replaying the previous raw
 		// reply — that would grow the context on every failed attempt.
 		messages = []chatMessage{
-			{Role: "system", Content: reviewPrompt(p.Rules, hasGoFiles(group), p.SuggestFixes)},
+			{Role: "system", Content: reviewPrompt(groupRules(p, group), hasGoFiles(group), p.SuggestFixes)},
 			{Role: "user", Content: fmt.Sprintf(reviewRetryLead(),
 				strings.Join(bad, " / "), fixHint, prefix, diff, truncated)},
 		}
-		raw, err = c.chat(ctx, messages)
+		raw, err = c.chat(ctx, messages, seed)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("group %d/%d: %w", num, total, err)
 		}
 		// Accumulate instead of overwriting: a model may answer the feedback
 		// with only the corrected lines, so round-1 findings must survive.
@@ -717,6 +1116,114 @@ func splitDiffFiles(diff []byte) [][]byte {
 	}
 	chunks = append(chunks, []byte(s[prev:]))
 	return chunks
+}
+
+// parseDiffRanges returns the new-file line ranges each diff path touches.
+// The map key is the new path (the "+++ b/<path>" form); a deleted file is
+// absent because its +++ header is /dev/null.
+func parseDiffRanges(diff []byte) map[string][][2]int {
+	ranges := map[string][][2]int{}
+	path := ""
+	for _, line := range strings.Split(string(diff), "\n") {
+		if strings.HasPrefix(line, "+++ ") {
+			p := strings.TrimPrefix(strings.TrimSpace(line), "+++ ")
+			p = strings.TrimPrefix(p, "b/")
+			if p == "/dev/null" {
+				path = ""
+				continue
+			}
+			path = p
+			continue
+		}
+		if path == "" || !strings.HasPrefix(line, "@@ ") {
+			continue
+		}
+		// @@ -<old>[,<n>] +<new>[,<n>] @@
+		plus := strings.Index(line, "+")
+		if plus < 0 {
+			continue
+		}
+		rest := line[plus+1:]
+		if end := strings.IndexByte(rest, ' '); end >= 0 {
+			rest = rest[:end]
+		}
+		parts := strings.SplitN(rest, ",", 2)
+		start, err := strconv.Atoi(parts[0])
+		if err != nil {
+			continue
+		}
+		count := 1
+		if len(parts) == 2 {
+			if n, err := strconv.Atoi(parts[1]); err == nil {
+				count = n
+			}
+		}
+		if count > 0 {
+			ranges[path] = append(ranges[path], [2]int{start, start + count - 1})
+		}
+	}
+	return ranges
+}
+
+// splitLocation parses a finding location like "path/to/file.go:42" into its
+// path and line. A location without a trailing integer (e.g. "path/to/file.go"
+// or "path:colon:name") yields line 0, meaning "file-level finding".
+func splitLocation(loc string) (path string, line int) {
+	i := strings.LastIndex(loc, ":")
+	if i < 0 {
+		return loc, 0
+	}
+	n, err := strconv.Atoi(loc[i+1:])
+	if err != nil {
+		return loc, 0
+	}
+	return loc[:i], n
+}
+
+// filterValidLocations drops findings whose location cannot be confirmed
+// inside the reviewed diff, protecting against drifted file names or line
+// numbers in the model reply. It returns the input slice unchanged when
+// validation is disabled or the diff could not be parsed.
+func (c *Client) filterValidLocations(p ReviewParams, findings []Finding, ranges map[string][][2]int) []Finding {
+	if !p.ValidateLocations || ranges == nil {
+		return findings
+	}
+	kept := findings[:0]
+	for _, f := range findings {
+		if f.Location == "" {
+			kept = append(kept, f)
+			continue
+		}
+		path, line := splitLocation(f.Location)
+		rs, ok := ranges[path]
+		if !ok {
+			c.logDroppedLocation(p, f, "file not in diff")
+			continue
+		}
+		if line == 0 {
+			kept = append(kept, f)
+			continue
+		}
+		valid := false
+		for _, r := range rs {
+			if line >= r[0] && line <= r[1] {
+				valid = true
+				break
+			}
+		}
+		if !valid {
+			c.logDroppedLocation(p, f, "line out of diff range")
+			continue
+		}
+		kept = append(kept, f)
+	}
+	return kept
+}
+
+func (c *Client) logDroppedLocation(p ReviewParams, f Finding, why string) {
+	if p.Logf != nil {
+		p.Logf("review location dropped (%s): %s", why, f.line())
+	}
 }
 
 // changedLines counts added and removed lines in a diff chunk, excluding
@@ -983,7 +1490,7 @@ func (c *Client) GeneratePRTitle(ctx context.Context, cfg config.Commit, diff []
 		{Role: "user", Content: fmt.Sprintf("%s\n\n%s\n\n%s%s",
 			diffStatsLine(files, changedLines), prTitleUserLead(), body, truncated)},
 	}
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1015,7 +1522,7 @@ func (c *Client) GenerateExplanation(ctx context.Context, cfg config.Commit, pat
 		{Role: "system", Content: explainSystemPrompt(cfg)},
 		{Role: "user", Content: fmt.Sprintf("%s\n\n%s%s", explainUserLead(path), body, truncated)},
 	}
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1112,7 +1619,7 @@ func (c *Client) GenerateSplitSuggestion(ctx context.Context, cfg config.Commit,
 		{Role: "user", Content: fmt.Sprintf("%s\n\n%s\n\n%s%s",
 			diffStatsLine(files, changedLines), splitUserLead(), body, truncated)},
 	}
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
@@ -1155,7 +1662,7 @@ func (c *Client) GenerateChangelog(ctx context.Context, cfg config.Commit, input
 		{Role: "system", Content: changelogSystemPrompt(cfg)},
 		{Role: "user", Content: fmt.Sprintf("%s\n\n%s%s", changelogUserLead(), input, truncated)},
 	}
-	raw, err := c.chat(ctx, messages)
+	raw, err := c.chat(ctx, messages, nil)
 	if err != nil {
 		return "", err
 	}
