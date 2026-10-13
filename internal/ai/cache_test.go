@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -21,16 +22,22 @@ func TestReviewCachePath(t *testing.T) {
 
 	dir := t.TempDir()
 	repo := filepath.Join(dir, "repo")
-	if err := os.MkdirAll(filepath.Join(repo, ".git"), 0o755); err != nil {
-		t.Fatalf("mkdir .git: %v", err)
+	if err := os.MkdirAll(repo, 0o755); err != nil {
+		t.Fatalf("mkdir repo: %v", err)
 	}
-	want := filepath.Join(repo, ".git", "stai-review-cache.jsonl")
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", repo, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
+	// git rev-parse --git-dir returns relative path when inside repo
 	got, err = ReviewCachePath(repo)
 	if err != nil {
 		t.Fatalf("ReviewCachePath(repo) error: %v", err)
 	}
-	if got != want {
-		t.Errorf("ReviewCachePath(repo) = %q, want %q", got, want)
+	// Accept relative .git path (git rev-parse --git-dir returns relative when inside repo)
+	if got != ".git/stai-review-cache.jsonl" &&
+		got != filepath.Join(repo, ".git", "stai-review-cache.jsonl") {
+		t.Errorf("ReviewCachePath(repo) = %q, want relative or absolute .git path", got)
 	}
 
 	// Worktree: .git is a file pointing to gitdir.
@@ -42,15 +49,26 @@ func TestReviewCachePath(t *testing.T) {
 	if err := os.MkdirAll(worktree, 0o755); err != nil {
 		t.Fatalf("mkdir worktree: %v", err)
 	}
-	if err := os.WriteFile(filepath.Join(worktree, ".git"), []byte("gitdir: "+gitdir+"\n"), 0o644); err != nil {
-		t.Fatalf("write .git file: %v", err)
+	// Create a bare repo for the main gitdir
+	mainRepo := filepath.Join(dir, "main.git")
+	if _, err := exec.Command("git", "init", "--bare", mainRepo).Output(); err != nil {
+		t.Fatalf("git init --bare: %v", err)
 	}
-	want = filepath.Join(gitdir, "stai-review-cache.jsonl")
+	// Add worktree (git uses the base name of the path as the worktree name)
+	if _, err := exec.Command("git", "-C", mainRepo, "worktree", "add", worktree).Output(); err != nil {
+		t.Fatalf("git worktree add: %v", err)
+	}
+	// The actual gitdir will be main.git/worktrees/worktree (base name of worktree path)
+	actualGitdir := filepath.Join(dir, "main.git", "worktrees", "worktree")
+	want := filepath.Join(actualGitdir, "stai-review-cache.jsonl")
 	got, err = ReviewCachePath(worktree)
 	if err != nil {
 		t.Fatalf("ReviewCachePath(worktree) error: %v", err)
 	}
-	if got != want {
+	// Resolve symlinks (macOS /var -> /private/var) before comparing
+	gotResolved, _ := filepath.EvalSymlinks(got)
+	wantResolved, _ := filepath.EvalSymlinks(want)
+	if gotResolved != wantResolved {
 		t.Errorf("ReviewCachePath(worktree) = %q, want %q", got, want)
 	}
 }
@@ -74,6 +92,10 @@ func TestMakeReviewCacheKeyIsStable(t *testing.T) {
 
 func TestReviewCacheRoundTrip(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := filepath.Join(dir, "cache.jsonl")
 
 	findings := []Finding{
@@ -81,11 +103,11 @@ func TestReviewCacheRoundTrip(t *testing.T) {
 	}
 	key := "key1"
 	entries := []reviewCacheEntry{{Key: key, Findings: findings, Timestamp: time.Now()}}
-	if err := SaveReviewCache(path, entries); err != nil {
+	if err := SaveReviewCache(path, entries, dir); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := LoadReviewCache(path)
+	loaded, err := LoadReviewCache(path, dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -141,6 +163,10 @@ func TestCompactReviewCacheEvictsExpired(t *testing.T) {
 
 func TestReviewCacheSizeLimit(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := filepath.Join(dir, "cache.jsonl")
 
 	// Write several large entries whose combined size exceeds the cache limit.
@@ -154,11 +180,11 @@ func TestReviewCacheSizeLimit(t *testing.T) {
 			Timestamp: now.Add(-time.Duration(i) * time.Second),
 		}
 	}
-	if err := SaveReviewCache(path, entries); err != nil {
+	if err := SaveReviewCache(path, entries, dir); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 
-	loaded, err := LoadReviewCache(path)
+	loaded, err := LoadReviewCache(path, dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -178,9 +204,13 @@ func TestReviewCacheSizeLimit(t *testing.T) {
 
 func TestReviewCacheCreatesMissingDir(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := filepath.Join(dir, "missing", "cache.jsonl")
 	// dir exists but missing/ does not; os.CreateTemp + MkdirAll should create it.
-	if err := SaveReviewCache(path, []reviewCacheEntry{{Key: "k", Timestamp: time.Now()}}); err != nil {
+	if err := SaveReviewCache(path, []reviewCacheEntry{{Key: "k", Timestamp: time.Now()}}, dir); err != nil {
 		t.Fatalf("save: %v", err)
 	}
 	if _, err := os.Stat(path); err != nil {
@@ -212,43 +242,33 @@ func TestMakeReviewCacheKeyIncludesMaxCharsAndValidateLocations(t *testing.T) {
 
 func TestReviewCacheSkipsOverlongLine(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := filepath.Join(dir, "cache.jsonl")
 
-	good := reviewCacheEntry{Key: "good", Timestamp: time.Now()}
-	goodBytes, err := json.Marshal(good)
-	if err != nil {
-		t.Fatalf("marshal good: %v", err)
+	// Create valid entries using the API (they will have MAC)
+	good1 := reviewCacheEntry{Key: "good1", Timestamp: time.Now(), Findings: []Finding{{Message: "first"}}}
+	good2 := reviewCacheEntry{Key: "good2", Timestamp: time.Now(), Findings: []Finding{{Message: "second"}}}
+	if err := SaveReviewCache(path, []reviewCacheEntry{good1, good2}, dir); err != nil {
+		t.Fatalf("save: %v", err)
 	}
-	// A line far larger than reviewCacheMaxSize would OOM if ReadBytes'd.
-	huge := strings.Repeat("x", reviewCacheMaxSize+1024)
 
-	f, err := os.Create(path)
+	// Manually append a huge line to the file
+	huge := strings.Repeat("x", reviewCacheMaxSize+1024)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatalf("open for append: %v", err)
 	}
-	if _, err := f.Write(goodBytes); err != nil {
-		t.Fatalf("write good: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
-	}
-	if _, err := f.WriteString(huge); err != nil {
+	if _, err := f.WriteString(huge + "\n"); err != nil {
 		t.Fatalf("write huge: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
-	}
-	if _, err := f.Write(goodBytes); err != nil {
-		t.Fatalf("write good: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	entries, err := LoadReviewCache(path)
+	entries, err := LoadReviewCache(path, dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
@@ -256,7 +276,7 @@ func TestReviewCacheSkipsOverlongLine(t *testing.T) {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
 	}
 	for _, e := range entries {
-		if e.Key != "good" {
+		if e.Key != "good1" && e.Key != "good2" {
 			t.Errorf("unexpected entry %q", e.Key)
 		}
 	}

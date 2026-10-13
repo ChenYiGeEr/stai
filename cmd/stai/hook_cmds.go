@@ -138,9 +138,15 @@ func hookPreCommit() {
 		return
 	}
 
+	repoDir, err := os.Getwd()
+	if err != nil {
+		logf("hook pre-commit: getwd failed: %v", err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff, false, false, "")
+	findings, err := generateReview(ctx, cfg, repoDir, diff, false, false, "")
 	if err != nil {
 		logf("hook pre-commit: %v (passing)", err)
 		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_commit")+"\n", err)
@@ -185,9 +191,15 @@ func hookPrePush() {
 		return
 	}
 
+	repoDir, err := os.Getwd()
+	if err != nil {
+		logf("hook pre-push: getwd failed: %v", err)
+		return
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), time.Duration(cfg.Hook.TimeoutSec)*time.Second)
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff, false, false, "")
+	findings, err := generateReview(ctx, cfg, repoDir, diff, false, false, "")
 	if err != nil {
 		logf("hook pre-push: %v (passing)", err)
 		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("review_failed_push")+"\n", err)

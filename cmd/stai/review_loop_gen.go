@@ -5,11 +5,13 @@ package main
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -64,6 +66,12 @@ func cmdReviewLoopGen(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	// Cap iterations at 100 to prevent runaway loops
 	if cfg.ReviewLoop.MaxIterations <= 0 {
@@ -81,8 +89,8 @@ func cmdReviewLoopGen(args []string) {
 		defer cancel()
 	}
 
-	logf("review-loop-gen start repo=%s max_iter=%d timeout=%ds strict=%v mcp_timeout=%ds",
-		repoDir, cfg.ReviewLoop.MaxIterations, cfg.ReviewLoop.Timeout, cfg.ReviewLoop.Strict, cfg.ReviewLoop.MCPTimeout)
+	logf("review-loop-gen start repo=%s max_iter=%d timeout=%ds strict=%v mcp_timeout=%ds model=%s",
+		repoDir, cfg.ReviewLoop.MaxIterations, cfg.ReviewLoop.Timeout, cfg.ReviewLoop.Strict, cfg.ReviewLoop.MCPTimeout, cfg.Provider.Model)
 
 	// Load custom fix prompt if provided
 	fixPrompt := defaultFixPrompt
@@ -98,6 +106,8 @@ func cmdReviewLoopGen(args []string) {
 	iter := 0
 	var lastFindings []ai.Finding
 	var lastErr error
+	var prevFindingsHash string
+	staleIterations := 0
 
 	for iter < cfg.ReviewLoop.MaxIterations {
 		select {
@@ -146,6 +156,20 @@ func cmdReviewLoopGen(args []string) {
 			// Generate commit message
 			runGen(ctx, repoDir, cfg)
 			return
+		}
+
+		// P2-1: Detect stale loop - compute findings hash and break if unchanged for 3 iterations
+		findingsHash := hashFindings(findings)
+		if findingsHash == prevFindingsHash {
+			staleIterations++
+			if staleIterations >= 3 {
+				logf("review-loop-gen iter %d: findings unchanged for 3 iterations, aborting", iter)
+				fmt.Fprintf(os.Stderr, "review-loop-gen: findings unchanged for 3 iterations, aborting to prevent infinite loop\n")
+				os.Exit(1)
+			}
+		} else {
+			staleIterations = 0
+			prevFindingsHash = findingsHash
 		}
 
 		// Review has findings - print summary
@@ -212,20 +236,24 @@ func runReview(ctx context.Context, cfg config.Config, repoDir string, diff []by
 	reviewBaseURL, _, reviewModel, reviewTemperature := reviewProvider(cfg)
 	logf("review-loop-gen review model=%s base_url=%s temperature=%v", reviewModel, reviewBaseURL, reviewTemperature)
 
+	repoRoot := ""
+	if root, err := git.RepoRootAt(repoDir); err == nil {
+		repoRoot = root
+	}
+
 	cachePath := ""
-	if cfg.Review.Cache {
-		if root, err := git.RepoRootAt(repoDir); err == nil {
-			cachePath, err = ai.ReviewCachePath(root)
-			if err != nil {
-				logf("review cache disabled: %v", err)
-				cachePath = ""
-			}
+	if cfg.Review.Cache && repoRoot != "" {
+		var err error
+		cachePath, err = ai.ReviewCachePath(repoRoot)
+		if err != nil {
+			logf("review cache disabled: %v", err)
+			cachePath = ""
 		}
 	}
 
 	sessionPath := ""
-	if root, err := git.RepoRootAt(repoDir); err == nil {
-		if sp, serr := ai.ReviewSessionPath(root); serr == nil {
+	if repoRoot != "" {
+		if sp, serr := ai.ReviewSessionPath(repoRoot); serr == nil {
 			sessionPath = sp
 		}
 	}
@@ -255,6 +283,7 @@ func runReview(ctx context.Context, cfg config.Config, repoDir string, diff []by
 		ResumeID:          "",
 		ValidateLocations: cfg.Review.ValidateLocations,
 		CachePath:         cachePath,
+		RepoRoot:          repoRoot,
 		Logf:              logf,
 	})
 
@@ -302,12 +331,16 @@ func generateFixDirectly(ctx context.Context, cfg config.Config, diff []byte, fi
 	client.Temperature = reviewTemperature
 	client.Logf = logf
 
-	// Convert findings to a summary string
+	// Convert findings to a summary string with escaping to prevent prompt injection
 	var findingsSummary strings.Builder
 	for _, f := range findings {
-		findingsSummary.WriteString(fmt.Sprintf("[%s] %s - %s\n", strings.ToUpper(f.Severity), f.Location, f.Message))
+		// Escape newlines and template delimiters to prevent injection
+		msg := escapeForPrompt(f.Message)
+		loc := escapeForPrompt(f.Location)
+		findingsSummary.WriteString(fmt.Sprintf("[%s] %s - %s\n", strings.ToUpper(f.Severity), loc, msg))
 		if f.SuggestedFix != "" {
-			findingsSummary.WriteString(fmt.Sprintf("  Fix suggestion: %s\n", f.SuggestedFix))
+			fix := escapeForPrompt(f.SuggestedFix)
+			findingsSummary.WriteString(fmt.Sprintf("  Fix suggestion: %s\n", fix))
 		}
 	}
 
@@ -401,8 +434,11 @@ func mustMarshal(v any) json.RawMessage {
 
 // gitAddU runs `git add -u` in the repo directory.
 func gitAddU(repoDir string) error {
-	cmd := exec.Command("git", "add", "-u")
-	cmd.Dir = repoDir
+	absDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		return fmt.Errorf("resolve repo dir: %w", err)
+	}
+	cmd := exec.Command("git", "-C", absDir, "add", "-u")
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_CTYPE=en_US.UTF-8")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
@@ -413,26 +449,99 @@ func gitAddU(repoDir string) error {
 
 // applyDiff applies a unified diff to the repository.
 func applyDiff(repoDir string, diff []byte) error {
-	// Write diff to a temp file and use git apply --index to stage new files
-	tmpFile, err := os.CreateTemp("", "stai-fix-*.patch")
+	// 1. Validate diff first (syntax + path traversal)
+	if err := validateDiff(repoDir, diff); err != nil {
+		return fmt.Errorf("diff validation failed: %w", err)
+	}
+
+	// 2. Create secure temp directory (0700 permissions)
+	tmpDir, err := os.MkdirTemp("", "stai-fix-")
 	if err != nil {
 		return err
 	}
-	defer os.Remove(tmpFile.Name())
-	if _, err := tmpFile.Write(diff); err != nil {
-		tmpFile.Close()
+	defer os.RemoveAll(tmpDir)
+
+	tmpFile := filepath.Join(tmpDir, "fix.patch")
+	if err := os.WriteFile(tmpFile, diff, 0o600); err != nil {
 		return err
 	}
-	tmpFile.Close()
 
-	cmd := exec.Command("git", "apply", "--index", "--whitespace=nowarn", tmpFile.Name())
-	cmd.Dir = repoDir
+	absDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		return fmt.Errorf("resolve repo dir: %w", err)
+	}
+	cmd := exec.Command("git", "-C", absDir, "apply", "--index", "--whitespace=nowarn", tmpFile)
 	cmd.Env = append(os.Environ(), "LANG=en_US.UTF-8", "LC_CTYPE=en_US.UTF-8")
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return fmt.Errorf("git apply: %v: %s", err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// validateDiff checks diff for syntax validity and path traversal attempts.
+func validateDiff(repoDir string, diff []byte) error {
+	// Check for path traversal in diff headers
+	for _, line := range strings.Split(string(diff), "\n") {
+		if strings.HasPrefix(line, "+++ b/") || strings.HasPrefix(line, "--- a/") {
+			path := strings.TrimSpace(strings.TrimPrefix(line, "+++ b/"))
+			path = strings.TrimSpace(strings.TrimPrefix(path, "--- a/"))
+			// Normalize path and check for directory traversal
+			cleanPath := filepath.Clean(path)
+			if strings.HasPrefix(cleanPath, ".."+string(filepath.Separator)) || cleanPath == ".." {
+				return fmt.Errorf("diff contains path traversal: %s", path)
+			}
+		}
+	}
+	// Syntax check with git apply --check in the repo directory
+	tmpFile, err := os.CreateTemp("", "stai-check-*.patch")
+	if err != nil {
+		return err
+	}
+	defer os.Remove(tmpFile.Name())
+	if err := os.WriteFile(tmpFile.Name(), diff, 0o600); err != nil {
+		return err
+	}
+	absDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		return fmt.Errorf("resolve repo dir: %w", err)
+	}
+	cmd := exec.Command("git", "-C", absDir, "apply", "--check", tmpFile.Name())
+	if out, err := cmd.CombinedOutput(); err != nil {
+		return fmt.Errorf("git apply --check failed: %s", strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// hashFindings computes a stable hash of the findings for stale-loop detection.
+// Uses JSON encoding to avoid delimiter collision issues.
+func hashFindings(findings []ai.Finding) string {
+	h := sha256.New()
+	enc := json.NewEncoder(h)
+	for _, f := range findings {
+		if err := enc.Encode(f); err != nil {
+			// Should not happen with this structure
+			continue
+		}
+	}
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// escapeForPrompt escapes special characters in user-controlled content
+// to prevent prompt injection when substituting into templates.
+func escapeForPrompt(s string) string {
+	// Replace newlines with spaces to prevent multi-line injection
+	s = strings.ReplaceAll(s, "\n", " ")
+	// Replace template delimiters
+	s = strings.ReplaceAll(s, "{{", "&#123;&#123;")
+	s = strings.ReplaceAll(s, "}}", "&#125;&#125;")
+	// Limit length to prevent context overflow (truncate at rune boundary)
+	const maxLen = 500
+	runes := []rune(s)
+	if len(runes) > maxLen {
+		s = string(runes[:maxLen]) + "..."
+	}
+	return s
 }
 
 // runGen runs the gen command to generate a commit message.

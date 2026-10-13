@@ -1,8 +1,8 @@
 package ai
 
 import (
-	"encoding/json"
 	"os"
+	"os/exec"
 	"strings"
 	"testing"
 	"time"
@@ -10,6 +10,10 @@ import (
 
 func TestUpsertReviewSessionRejectsOversizedEntry(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := dir + "/sessions.jsonl"
 
 	entry := reviewSession{
@@ -24,53 +28,52 @@ func TestUpsertReviewSessionRejectsOversizedEntry(t *testing.T) {
 			Message:  strings.Repeat("x", sessionMaxSize+1024),
 		}},
 	}
-	if err := UpsertReviewSession(path, entry); err == nil {
+	if err := UpsertReviewSession(path, entry, dir); err == nil {
 		t.Fatalf("expected oversized session to be rejected")
 	}
 }
 
 func TestLoadReviewSessionsSkipsOverlongLine(t *testing.T) {
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	path := dir + "/sessions.jsonl"
 
-	good := reviewSession{ID: "good", Timestamp: time.Now()}
-	goodBytes, err := json.Marshal(good)
-	if err != nil {
-		t.Fatalf("marshal: %v", err)
+	// Create valid entries using the API (they will have MAC)
+	good1 := reviewSession{ID: "good1", Timestamp: time.Now(), CompletedGroups: []int{1}, TotalGroups: 1}
+	good2 := reviewSession{ID: "good2", Timestamp: time.Now(), CompletedGroups: []int{1}, TotalGroups: 1}
+	if err := UpsertReviewSession(path, good1, dir); err != nil {
+		t.Fatalf("upsert good1: %v", err)
 	}
-	huge := strings.Repeat("x", sessionMaxSize+1024)
+	if err := UpsertReviewSession(path, good2, dir); err != nil {
+		t.Fatalf("upsert good2: %v", err)
+	}
 
-	f, err := os.Create(path)
+	// Manually append a huge line to the file
+	huge := strings.Repeat("x", sessionMaxSize+1024)
+	f, err := os.OpenFile(path, os.O_APPEND|os.O_WRONLY, 0o644)
 	if err != nil {
-		t.Fatalf("create: %v", err)
+		t.Fatalf("open for append: %v", err)
 	}
-	if _, err := f.Write(goodBytes); err != nil {
-		t.Fatalf("write good: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
-	}
-	if _, err := f.WriteString(huge); err != nil {
+	if _, err := f.WriteString(huge + "\n"); err != nil {
 		t.Fatalf("write huge: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
-	}
-	if _, err := f.Write(goodBytes); err != nil {
-		t.Fatalf("write good: %v", err)
-	}
-	if _, err := f.WriteString("\n"); err != nil {
-		t.Fatalf("write newline: %v", err)
 	}
 	if err := f.Close(); err != nil {
 		t.Fatalf("close: %v", err)
 	}
 
-	entries, err := LoadReviewSessions(path)
+	entries, err := LoadReviewSessions(path, dir)
 	if err != nil {
 		t.Fatalf("load: %v", err)
 	}
 	if len(entries) != 2 {
 		t.Fatalf("expected 2 entries, got %d", len(entries))
+	}
+	for _, e := range entries {
+		if e.ID != "good1" && e.ID != "good2" {
+			t.Errorf("unexpected entry %q", e.ID)
+		}
 	}
 }

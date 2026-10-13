@@ -8,6 +8,7 @@ import (
 	"flag"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 
@@ -223,7 +224,22 @@ func callTool(cfg config.Config, ctx context.Context, req mcpRequest) mcpRespons
 		return toolErrResp(req, "no diff to review: pass diff text or a repo_dir with staged changes")
 	}
 
-	findings, err := generateReview(ctx, cfg, diff, false, false, "")
+	repoDir := args.RepoDir
+	if repoDir == "" {
+		var err error
+		repoDir, err = os.Getwd()
+		if err != nil {
+			return toolErrResp(req, err.Error())
+		}
+	} else {
+		var err error
+		repoDir, err = filepath.Abs(repoDir)
+		if err != nil {
+			return toolErrResp(req, err.Error())
+		}
+	}
+
+	findings, err := generateReview(ctx, cfg, repoDir, diff, false, false, "")
 	out := buildReviewJSONOutput(findings, err)
 	b, jerr := json.MarshalIndent(out, "", "  ")
 	if jerr != nil {

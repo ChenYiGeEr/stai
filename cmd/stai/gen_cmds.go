@@ -42,6 +42,13 @@ func cmdGen(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
+
 	diff, err := git.StagedDiffDir(repoDir)
 	fatal(err)
 	if len(bytes.TrimSpace(diff)) == 0 {
@@ -101,6 +108,12 @@ func cmdPR(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	baseRef := cfg.PrePush.BaseRef
 	logf("pr start args=%q model=%s base_url=%s base=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL, baseRef)
@@ -158,6 +171,12 @@ func cmdPRTitle(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	baseRef := cfg.PrePush.BaseRef
 	logf("pr-title start args=%q model=%s base_url=%s base=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL, baseRef)
@@ -208,6 +227,12 @@ func cmdStashMsg(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	logf("stash-msg start args=%q model=%s base_url=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL)
 
@@ -268,6 +293,12 @@ func cmdExplain(args []string) {
 			fatal(err)
 		}
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	// Resolve relative paths against the repository root, validate, then read
 	// the absolute path directly. No chdir: the file is addressed absolutely
@@ -330,6 +361,12 @@ func cmdSplit(args []string) {
 	if repoDir == "" {
 		repoDir = "."
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	cfg := loadConfig()
 
@@ -378,6 +415,12 @@ func cmdChangelog(args []string) {
 	if repoDir == "" {
 		repoDir = "."
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	cfg := loadConfig()
 

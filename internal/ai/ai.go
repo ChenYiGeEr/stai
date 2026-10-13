@@ -391,6 +391,7 @@ type ReviewParams struct {
 	ResumeID          string                           // short/full session id to resume; "" starts fresh
 	ValidateLocations bool                             // drop findings whose file/line is outside the diff
 	CachePath         string                           // path to the repo-local cache file
+	RepoRoot          string                           // repository root directory (for cache/session HMAC)
 	Logf              func(format string, args ...any) // optional per-group progress log
 }
 
@@ -424,7 +425,7 @@ func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding,
 			// diff/config unrecoverable; drop it so --resume does not offer a
 			// session that would be skipped on the next run anyway.
 			if p.SessionPath != "" {
-				if err := DeleteReviewSession(p.SessionPath, c.reviewCacheKey(p)); err != nil && p.Logf != nil {
+				if err := DeleteReviewSession(p.SessionPath, c.reviewCacheKey(p), p.RepoRoot); err != nil && p.Logf != nil {
 					p.Logf("review cache hit: stale session cleanup failed: %v", err)
 				}
 			}
@@ -442,7 +443,7 @@ func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding,
 	if p.SessionPath != "" {
 		key = c.reviewCacheKey(p)
 		if p.ResumeID != "" {
-			s, serr := FindReviewSession(p.SessionPath, p.ResumeID)
+			s, serr := FindReviewSession(p.SessionPath, p.ResumeID, p.RepoRoot)
 			if serr != nil {
 				return nil, serr
 			}
@@ -532,7 +533,7 @@ func (c *Client) GenerateReview(ctx context.Context, p ReviewParams) ([]Finding,
 	// A successful run closes out any session left over from a failed run
 	// with the same diff/config.
 	if p.SessionPath != "" {
-		if derr := DeleteReviewSession(p.SessionPath, key); derr != nil && p.Logf != nil {
+		if derr := DeleteReviewSession(p.SessionPath, key, p.RepoRoot); derr != nil && p.Logf != nil {
 			p.Logf("review session delete failed: %v", derr)
 		}
 	}
@@ -699,7 +700,7 @@ func (c *Client) reviewCacheKey(p ReviewParams) string {
 }
 
 func (c *Client) loadCachedReview(p ReviewParams) []Finding {
-	entries, err := LoadReviewCache(p.CachePath)
+	entries, err := LoadReviewCache(p.CachePath, p.RepoRoot)
 	if err != nil {
 		if p.Logf != nil {
 			p.Logf("review cache load failed: %v", err)
@@ -710,7 +711,7 @@ func (c *Client) loadCachedReview(p ReviewParams) []Finding {
 }
 
 func (c *Client) saveCachedReview(p ReviewParams, findings []Finding) error {
-	entries, err := LoadReviewCache(p.CachePath)
+	entries, err := LoadReviewCache(p.CachePath, p.RepoRoot)
 	if err != nil {
 		return err
 	}
@@ -720,7 +721,7 @@ func (c *Client) saveCachedReview(p ReviewParams, findings []Finding) error {
 		Timestamp: time.Now(),
 	})
 	entries = CompactReviewCache(entries)
-	return SaveReviewCache(p.CachePath, entries)
+	return SaveReviewCache(p.CachePath, entries, p.RepoRoot)
 }
 
 // groupContext returns a context for a single review group. If timeout is
@@ -750,7 +751,7 @@ func (c *Client) saveSessionSnapshot(p ReviewParams, key string, completed []int
 		Findings:        findings,
 		Error:           runErr,
 	}
-	if err := UpsertReviewSession(p.SessionPath, entry); err != nil {
+	if err := UpsertReviewSession(p.SessionPath, entry, p.RepoRoot); err != nil {
 		if p.Logf != nil {
 			p.Logf("review session save failed: %v", err)
 		}

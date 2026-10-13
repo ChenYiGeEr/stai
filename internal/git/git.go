@@ -180,3 +180,18 @@ func HookPath(name string) (string, error) {
 	}
 	return strings.TrimSpace(string(out)), nil
 }
+
+// GitDir returns the .git directory path for the repository at dir.
+// Uses `git rev-parse --git-dir` which is safe against symlink attacks
+// on the .git file in worktrees.
+func GitDir(dir string) (string, error) {
+	args := []string{"rev-parse", "--git-dir"}
+	if dir != "" {
+		args = append([]string{"-C", dir}, args...)
+	}
+	out, err := exec.Command("git", args...).Output()
+	if err != nil {
+		return "", fmt.Errorf("not inside a git repository: %w", err)
+	}
+	return strings.TrimSpace(string(out)), nil
+}

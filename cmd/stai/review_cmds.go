@@ -48,6 +48,13 @@ func cmdReview(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
+
 	reviewBaseURL, _, reviewModel, reviewTemperature := reviewProvider(cfg)
 	logf("review start args=%q model=%s base_url=%s temperature=%v", args, reviewModel, reviewBaseURL, reviewTemperature)
 
@@ -60,7 +67,7 @@ func cmdReview(args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
+	findings, err := generateReview(ctx, cfg, repoDir, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
 	var code int
 	if *formatFlag == "json" {
 		code = presentReviewJSON(findings, err, *outputFlag, "review")
@@ -100,35 +107,35 @@ func reviewProvider(cfg config.Config) (baseURL, apiKey, model string, temperatu
 
 // generateReview asks the configured model to review diff. Both the review
 // command and the pre-commit hook use it so provider wiring lives in one place.
-func generateReview(ctx context.Context, cfg config.Config, diff []byte, noCache, noValidateLocations bool, resumeID string) ([]ai.Finding, error) {
+func generateReview(ctx context.Context, cfg config.Config, repoDir string, diff []byte, noCache, noValidateLocations bool, resumeID string) ([]ai.Finding, error) {
 	baseURL, apiKey, model, temperature := reviewProvider(cfg)
 	client := ai.NewClient(baseURL, apiKey, model,
 		time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	client.Temperature = temperature
 	client.Logf = logf
 
+	repoRoot := ""
+	if root, err := git.RepoRootAt(repoDir); err == nil {
+		repoRoot = root
+	}
+
 	cachePath := ""
-	if cfg.Review.Cache {
-		if root, err := git.RepoRoot(); err == nil {
-			cachePath, err = ai.ReviewCachePath(root)
-			if err != nil {
-				logf("review cache disabled: %v", err)
-				cachePath = ""
-			}
-		} else {
+	if cfg.Review.Cache && repoRoot != "" {
+		var err error
+		cachePath, err = ai.ReviewCachePath(repoRoot)
+		if err != nil {
 			logf("review cache disabled: %v", err)
+			cachePath = ""
 		}
 	}
 
 	sessionPath := ""
-	if root, err := git.RepoRoot(); err == nil {
-		if sp, serr := ai.ReviewSessionPath(root); serr == nil {
+	if repoRoot != "" {
+		if sp, serr := ai.ReviewSessionPath(repoRoot); serr == nil {
 			sessionPath = sp
 		} else {
 			logf("review sessions disabled: %v", serr)
 		}
-	} else {
-		logf("review sessions disabled: %v", err)
 	}
 
 	return client.GenerateReview(ctx, ai.ReviewParams{
@@ -151,6 +158,7 @@ func generateReview(ctx context.Context, cfg config.Config, diff []byte, noCache
 		ResumeID:          resumeID,
 		ValidateLocations: cfg.Review.ValidateLocations && !noValidateLocations,
 		CachePath:         cachePath,
+		RepoRoot:          repoRoot,
 		Logf:              logf,
 	})
 }
@@ -388,6 +396,12 @@ func cmdReviewBranch(args []string) {
 		repoDir, err = os.Getwd()
 		fatal(err)
 	}
+	// Resolve to absolute path early for security
+	absRepoDir, err := filepath.Abs(repoDir)
+	if err != nil {
+		fatal(fmt.Errorf("resolve repo dir: %w", err))
+	}
+	repoDir = absRepoDir
 
 	baseRef := cfg.PrePush.BaseRef
 	reviewBaseURL, _, reviewModel, reviewTemperature := reviewProvider(cfg)
@@ -402,7 +416,7 @@ func cmdReviewBranch(args []string) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	findings, err := generateReview(ctx, cfg, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
+	findings, err := generateReview(ctx, cfg, repoDir, diff, *noCacheFlag, *noValidateFlag, *resumeFlag)
 	var code int
 	if *formatFlag == "json" {
 		code = presentReviewJSON(findings, err, *outputFlag, "review-branch")

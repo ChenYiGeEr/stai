@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -1001,6 +1002,10 @@ func TestGeneratePRRetriesOnNonconforming(t *testing.T) {
 func TestGenerateReviewCacheHitSkipsProvider(t *testing.T) {
 	setLang(t, "en")
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	cachePath := filepath.Join(dir, "cache.jsonl")
 
 	var calls int
@@ -1017,7 +1022,7 @@ func TestGenerateReviewCacheHitSkipsProvider(t *testing.T) {
 		Findings:  findings,
 		Timestamp: time.Now(),
 	}}
-	if err := SaveReviewCache(cachePath, entries); err != nil {
+	if err := SaveReviewCache(cachePath, entries, dir); err != nil {
 		t.Fatalf("save cache: %v", err)
 	}
 
@@ -1033,6 +1038,7 @@ func TestGenerateReviewCacheHitSkipsProvider(t *testing.T) {
 		Seed:          true,
 		Cache:         true,
 		CachePath:     cachePath,
+		RepoRoot:      dir,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1048,16 +1054,20 @@ func TestGenerateReviewCacheHitSkipsProvider(t *testing.T) {
 func TestGenerateReviewCacheHitCleansStaleSession(t *testing.T) {
 	setLang(t, "en")
 	dir := t.TempDir()
+	// Initialize a real git repo
+	if _, err := exec.Command("git", "-C", dir, "init").Output(); err != nil {
+		t.Fatalf("git init: %v", err)
+	}
 	cachePath := filepath.Join(dir, "cache.jsonl")
 	sessionPath := filepath.Join(dir, "sessions.jsonl")
 
 	// Pre-populate both a cache hit and a stale session for the same key.
 	key := MakeReviewCacheKey([]byte("diff"), "test-model", "http://x", 0, nil, false, false, "en", true, true, 100, 0, false, nil, false)
 	findings := []Finding{{Severity: "high", Location: "a.go:1", Message: "cached"}}
-	if err := SaveReviewCache(cachePath, []reviewCacheEntry{{Key: key, Findings: findings, Timestamp: time.Now()}}); err != nil {
+	if err := SaveReviewCache(cachePath, []reviewCacheEntry{{Key: key, Findings: findings, Timestamp: time.Now()}}, dir); err != nil {
 		t.Fatalf("save cache: %v", err)
 	}
-	if err := UpsertReviewSession(sessionPath, reviewSession{ID: key, Timestamp: time.Now(), CompletedGroups: []int{1}, TotalGroups: 2, Findings: findings}); err != nil {
+	if err := UpsertReviewSession(sessionPath, reviewSession{ID: key, Timestamp: time.Now(), CompletedGroups: []int{1}, TotalGroups: 2, Findings: findings}, dir); err != nil {
 		t.Fatalf("save session: %v", err)
 	}
 
@@ -1072,12 +1082,13 @@ func TestGenerateReviewCacheHitCleansStaleSession(t *testing.T) {
 		Cache:         true,
 		CachePath:     cachePath,
 		SessionPath:   sessionPath,
+		RepoRoot:      dir,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 
-	entries, err := LoadReviewSessions(sessionPath)
+	entries, err := LoadReviewSessions(sessionPath, dir)
 	if err != nil {
 		t.Fatalf("load sessions: %v", err)
 	}

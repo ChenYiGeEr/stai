@@ -3,6 +3,8 @@ package ai
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
@@ -10,16 +12,17 @@ import (
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
 
 	"stai/internal/config"
+	"stai/internal/git"
 )
 
 const (
 	reviewCacheMaxSize = 10 * 1024 * 1024 // 10 MB
 	reviewCacheMaxAge  = 7 * 24 * time.Hour
 	reviewCacheFile    = "stai-review-cache.jsonl"
+	reviewSecretFile   = "stai-review-secret.jsonl" // stores per-repo HMAC secret keys
 )
 
 // reviewCacheEntry is one cached review result.
@@ -27,42 +30,237 @@ type reviewCacheEntry struct {
 	Key       string    `json:"key"`
 	Findings  []Finding `json:"findings"`
 	Timestamp time.Time `json:"ts"`
+	MAC       string    `json:"mac,omitempty"` // HMAC-SHA256 of key+findings+timestamp
+	KeyID     string    `json:"key_id,omitempty"` // identifies which secret key was used
 }
 
 // ReviewCachePath returns the per-repo cache path, or "" when repoRoot is empty.
-// It handles git worktrees where .git is a file pointing to the real gitdir.
+// It handles git worktrees by using `git rev-parse --git-dir` to avoid symlink attacks.
 func ReviewCachePath(repoRoot string) (string, error) {
 	if repoRoot == "" {
 		return "", nil
 	}
-	gitPath := filepath.Join(repoRoot, ".git")
-	fi, err := os.Stat(gitPath)
+	gitDir, err := git.GitDir(repoRoot)
 	if err != nil {
 		return "", fmt.Errorf("locating .git: %w", err)
 	}
-	if fi.IsDir() {
-		return filepath.Join(gitPath, reviewCacheFile), nil
+	return filepath.Join(gitDir, reviewCacheFile), nil
+}
+
+// secretKeyPath returns the path to the secret key file for the repo.
+func secretKeyPath(repoRoot string) (string, error) {
+	if repoRoot == "" {
+		return "", nil
+	}
+	gitDir, err := git.GitDir(repoRoot)
+	if err != nil {
+		return "", fmt.Errorf("locating .git: %w", err)
+	}
+	return filepath.Join(gitDir, reviewSecretFile), nil
+}
+
+// secretKeyEntry represents a single secret key entry.
+type secretKeyEntry struct {
+	KeyID string `json:"key_id"`
+	Key   []byte `json:"key"`
+}
+
+// loadOrCreateSecret loads the current secret key for the repo, or creates a new one.
+func loadOrCreateSecret(repoRoot string) (keyID string, key []byte, err error) {
+	path, err := secretKeyPath(repoRoot)
+	if err != nil {
+		return "", nil, err
+	}
+	if path == "" {
+		return "", nil, nil
 	}
 
-	// .git is a file in a worktree; parse the gitdir line.
-	data, err := os.ReadFile(gitPath)
+	f, err := os.Open(path)
 	if err != nil {
-		return "", fmt.Errorf("reading .git file: %w", err)
+		if os.IsNotExist(err) {
+			// Create new secret key
+			return createSecretKey(path)
+		}
+		return "", nil, err
 	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "gitdir:") {
-			gitdir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
-			if gitdir == "" {
-				return "", fmt.Errorf("empty gitdir in .git file")
+	defer f.Close()
+
+	var entries []secretKeyEntry
+	rd := bufio.NewReader(f)
+	for {
+		line, truncated, err := readBoundedLine(rd, reviewCacheMaxSize)
+		if len(line) > 0 && !truncated {
+			line = bytes.TrimRight(line, "\r\n")
+			var e secretKeyEntry
+			if json.Unmarshal(line, &e) == nil && e.KeyID != "" {
+				entries = append(entries, e)
 			}
-			if !filepath.IsAbs(gitdir) {
-				gitdir = filepath.Join(repoRoot, gitdir)
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
 			}
-			return filepath.Join(gitdir, reviewCacheFile), nil
+			return "", nil, err
 		}
 	}
-	return "", fmt.Errorf("gitdir not found in .git file")
+
+	// Use the latest key (last entry)
+	if len(entries) > 0 {
+		latest := entries[len(entries)-1]
+		return latest.KeyID, latest.Key, nil
+	}
+
+	// No valid keys found, create new one
+	return createSecretKey(path)
+}
+
+// createSecretKey generates a new random secret key and saves it.
+func createSecretKey(path string) (string, []byte, error) {
+	keyID := make([]byte, 16)
+	if _, err := rand.Read(keyID); err != nil {
+		return "", nil, err
+	}
+	keyIDStr := fmt.Sprintf("%x", keyID)
+
+	key := make([]byte, 32)
+	if _, err := rand.Read(key); err != nil {
+		return "", nil, err
+	}
+
+	entry := secretKeyEntry{KeyID: keyIDStr, Key: key}
+	b, err := json.Marshal(entry)
+	if err != nil {
+		return "", nil, err
+	}
+
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		return "", nil, err
+	}
+
+	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
+	if err != nil {
+		return "", nil, err
+	}
+	tmp := f.Name()
+	bw := bufio.NewWriter(f)
+	if _, err := bw.Write(b); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", nil, err
+	}
+	if err := bw.WriteByte('\n'); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", nil, err
+	}
+	if err := bw.Flush(); err != nil {
+		f.Close()
+		os.Remove(tmp)
+		return "", nil, err
+	}
+	if err := f.Close(); err != nil {
+		os.Remove(tmp)
+		return "", nil, err
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		os.Remove(tmp)
+		return "", nil, err
+	}
+	return keyIDStr, key, nil
+}
+
+// getSecretForKeyID retrieves a specific secret key by ID (for verifying old entries).
+func getSecretForKeyID(repoRoot, keyID string) ([]byte, error) {
+	path, err := secretKeyPath(repoRoot)
+	if err != nil {
+		return nil, err
+	}
+	if path == "" {
+		return nil, nil
+	}
+
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, err
+	}
+	defer f.Close()
+
+	rd := bufio.NewReader(f)
+	for {
+		line, truncated, err := readBoundedLine(rd, reviewCacheMaxSize)
+		if len(line) > 0 && !truncated {
+			line = bytes.TrimRight(line, "\r\n")
+			var e secretKeyEntry
+			if json.Unmarshal(line, &e) == nil && e.KeyID == keyID {
+				return e.Key, nil
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("secret key %s not found", keyID)
+}
+
+// repoSecret returns the current HMAC secret for the repo.
+// Loads or creates a persistent random key instead of deriving from path.
+func repoSecret(repoRoot string) ([]byte, error) {
+	_, key, err := loadOrCreateSecret(repoRoot)
+	return key, err
+}
+
+// computeMAC computes HMAC-SHA256 of the cache entry data.
+// Uses JSON serialization to avoid delimiter collision issues.
+func computeMAC(secret []byte, e *reviewCacheEntry) string {
+	// Create a struct without MAC for deterministic serialization
+	data := struct {
+		Key       string    `json:"key"`
+		Findings  []Finding `json:"findings"`
+		Timestamp time.Time `json:"ts"`
+		KeyID     string    `json:"key_id,omitempty"`
+	}{
+		Key:       e.Key,
+		Findings:  e.Findings,
+		Timestamp: e.Timestamp,
+		KeyID:     e.KeyID,
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		// Should not happen with this structure
+		return ""
+	}
+	h := hmac.New(sha256.New, secret)
+	h.Write(b)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// verifyMAC verifies the HMAC of a cache entry.
+// Uses the KeyID to find the correct secret key for verification.
+func verifyMAC(repoRoot string, e *reviewCacheEntry) bool {
+	if e.MAC == "" {
+		return false // entries without MAC are rejected
+	}
+	// Get the secret key for this entry's KeyID
+	keyID := e.KeyID
+	if keyID == "" {
+		// Legacy entry without KeyID - try current secret
+		secret, err := repoSecret(repoRoot)
+		if err != nil {
+			return false
+		}
+		expected := computeMAC(secret, e)
+		return hmac.Equal([]byte(expected), []byte(e.MAC))
+	}
+	secret, err := getSecretForKeyID(repoRoot, keyID)
+	if err != nil {
+		return false
+	}
+	expected := computeMAC(secret, e)
+	return hmac.Equal([]byte(expected), []byte(e.MAC))
 }
 
 // MakeReviewCacheKey builds a deterministic cache key from all inputs that
@@ -148,7 +346,8 @@ func readBoundedLine(r *bufio.Reader, max int) (line []byte, truncated bool, err
 }
 
 // LoadReviewCache reads cached entries from path. Malformed lines are skipped.
-func LoadReviewCache(path string) ([]reviewCacheEntry, error) {
+// Entries with invalid or missing MAC are rejected (treated as corrupted).
+func LoadReviewCache(path string, repoRoot string) ([]reviewCacheEntry, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -169,7 +368,9 @@ func LoadReviewCache(path string) ([]reviewCacheEntry, error) {
 			line = bytes.TrimRight(line, "\r\n")
 			var e reviewCacheEntry
 			if json.Unmarshal(line, &e) == nil && e.Key != "" {
-				entries = append(entries, e)
+				if verifyMAC(repoRoot, &e) {
+					entries = append(entries, e)
+				}
 			}
 		}
 		if err != nil {
@@ -183,13 +384,26 @@ func LoadReviewCache(path string) ([]reviewCacheEntry, error) {
 }
 
 // SaveReviewCache writes entries to path atomically, creating parent dirs.
-func SaveReviewCache(path string, entries []reviewCacheEntry) error {
+// Each entry is signed with HMAC using the per-repo secret.
+func SaveReviewCache(path string, entries []reviewCacheEntry, repoRoot string) error {
 	if path == "" {
 		return nil
+	}
+	// Clone entries to avoid modifying caller's slice
+	clone := append([]reviewCacheEntry(nil), entries...)
+	keyID, secret, err := loadOrCreateSecret(repoRoot)
+	if err != nil {
+		return err
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+
+	// Add MAC and KeyID to each entry
+	for i := range clone {
+		clone[i].KeyID = keyID
+		clone[i].MAC = computeMAC(secret, &clone[i])
 	}
 
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
@@ -198,7 +412,7 @@ func SaveReviewCache(path string, entries []reviewCacheEntry) error {
 	}
 	tmp := f.Name()
 	bw := bufio.NewWriter(f)
-	for _, e := range entries {
+	for _, e := range clone {
 		b, err := json.Marshal(e)
 		if err != nil {
 			f.Close()

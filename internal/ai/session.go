@@ -3,14 +3,17 @@ package ai
 import (
 	"bufio"
 	"bytes"
+	"crypto/hmac"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 	"sort"
-	"strings"
 	"time"
+
+	"stai/internal/git"
 )
 
 const (
@@ -29,48 +32,28 @@ type reviewSession struct {
 	TotalGroups     int       `json:"total_groups"`
 	Findings        []Finding `json:"findings"`
 	Error           string    `json:"error,omitempty"` // the error that stopped the run, if any
+	MAC             string    `json:"mac,omitempty"`   // HMAC-SHA256 of session data
 }
 
 // ReviewSessionPath returns the per-repo session file path, or "" when
-// repoRoot is empty. It handles git worktrees like ReviewCachePath.
+// repoRoot is empty. It handles git worktrees by using `git rev-parse --git-dir`
+// to avoid symlink attacks.
 func ReviewSessionPath(repoRoot string) (string, error) {
 	if repoRoot == "" {
 		return "", nil
 	}
-	gitPath := filepath.Join(repoRoot, ".git")
-	fi, err := os.Stat(gitPath)
+	gitDir, err := git.GitDir(repoRoot)
 	if err != nil {
 		return "", fmt.Errorf("locating .git: %w", err)
 	}
-	if fi.IsDir() {
-		return filepath.Join(gitPath, sessionFile), nil
-	}
-
-	// .git is a file in a worktree; parse the gitdir line.
-	data, err := os.ReadFile(gitPath)
-	if err != nil {
-		return "", fmt.Errorf("reading .git file: %w", err)
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "gitdir:") {
-			gitdir := strings.TrimSpace(strings.TrimPrefix(line, "gitdir:"))
-			if gitdir == "" {
-				return "", fmt.Errorf("empty gitdir in .git file")
-			}
-			if !filepath.IsAbs(gitdir) {
-				gitdir = filepath.Join(repoRoot, gitdir)
-			}
-			return filepath.Join(gitdir, sessionFile), nil
-		}
-	}
-	return "", fmt.Errorf("gitdir not found in .git file")
+	return filepath.Join(gitDir, sessionFile), nil
 }
 
 // LoadReviewSessions reads session entries from path. Malformed lines are
 // skipped; lines longer than sessionMaxSize are consumed but skipped, so a
 // corrupt file cannot force an unbounded allocation.
-func LoadReviewSessions(path string) ([]reviewSession, error) {
+// Entries with invalid or missing MAC are rejected (treated as corrupted).
+func LoadReviewSessions(path string, repoRoot string) ([]reviewSession, error) {
 	if path == "" {
 		return nil, nil
 	}
@@ -91,7 +74,9 @@ func LoadReviewSessions(path string) ([]reviewSession, error) {
 			line = bytes.TrimRight(line, "\r\n")
 			var e reviewSession
 			if json.Unmarshal(line, &e) == nil && e.ID != "" {
-				entries = append(entries, e)
+				if verifySessionMAC(repoRoot, &e) {
+					entries = append(entries, e)
+				}
 			}
 		}
 		if err != nil {
@@ -105,13 +90,25 @@ func LoadReviewSessions(path string) ([]reviewSession, error) {
 }
 
 // SaveReviewSessions writes session entries atomically, creating parent dirs.
-func SaveReviewSessions(path string, entries []reviewSession) error {
+// Each entry is signed with HMAC using the per-repo secret.
+func SaveReviewSessions(path string, entries []reviewSession, repoRoot string) error {
 	if path == "" {
 		return nil
+	}
+	// Clone entries to avoid modifying caller's slice
+	clone := append([]reviewSession(nil), entries...)
+	secret, err := repoSecret(repoRoot)
+	if err != nil {
+		return err
 	}
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
 		return err
+	}
+
+	// Add MAC to each entry
+	for i := range clone {
+		clone[i].MAC = computeSessionMAC(secret, &clone[i])
 	}
 
 	f, err := os.CreateTemp(dir, filepath.Base(path)+".*.tmp")
@@ -120,7 +117,7 @@ func SaveReviewSessions(path string, entries []reviewSession) error {
 	}
 	tmp := f.Name()
 	bw := bufio.NewWriter(f)
-	for _, e := range entries {
+	for _, e := range clone {
 		b, err := json.Marshal(e)
 		if err != nil {
 			f.Close()
@@ -154,9 +151,54 @@ func SaveReviewSessions(path string, entries []reviewSession) error {
 	return nil
 }
 
+// computeSessionMAC computes HMAC-SHA256 of the session entry data.
+// Uses JSON serialization to avoid delimiter collision issues.
+func computeSessionMAC(secret []byte, s *reviewSession) string {
+	// Create a struct without MAC for deterministic serialization
+	data := struct {
+		ID              string    `json:"id"`
+		Timestamp       time.Time `json:"ts"`
+		CompletedGroups []int     `json:"completed_groups"`
+		TotalGroups     int       `json:"total_groups"`
+		Findings        []Finding `json:"findings"`
+		Error           string    `json:"error,omitempty"`
+	}{
+		ID:              s.ID,
+		Timestamp:       s.Timestamp,
+		CompletedGroups: s.CompletedGroups,
+		TotalGroups:     s.TotalGroups,
+		Findings:        s.Findings,
+		Error:           s.Error,
+	}
+	b, err := json.Marshal(data)
+	if err != nil {
+		return ""
+	}
+	h := hmac.New(sha256.New, secret)
+	h.Write(b)
+	return fmt.Sprintf("%x", h.Sum(nil))
+}
+
+// verifySessionMAC verifies the HMAC of a session entry.
+func verifySessionMAC(repoRoot string, s *reviewSession) bool {
+	if s.MAC == "" {
+		return false // entries without MAC are rejected
+	}
+	secret, err := repoSecret(repoRoot)
+	if err != nil {
+		return false
+	}
+	expected := computeSessionMAC(secret, s)
+	return hmac.Equal([]byte(expected), []byte(s.MAC))
+}
+
 // CompactReviewSessions removes expired entries and deduplicates by ID
 // (keeping the newest), trimming the file under the size cap.
-func CompactReviewSessions(entries []reviewSession) []reviewSession {
+func CompactReviewSessions(entries []reviewSession, repoRoot string) []reviewSession {
+	secret, err := repoSecret(repoRoot)
+	if err != nil {
+		return entries
+	}
 	cutoff := time.Now().Add(-sessionMaxAge)
 	latest := make(map[string]reviewSession)
 	for _, e := range entries {
@@ -185,6 +227,10 @@ func CompactReviewSessions(entries []reviewSession) []reviewSession {
 			break
 		}
 	}
+	// Add MAC to kept entries
+	for i := range kept {
+		kept[i].MAC = computeSessionMAC(secret, &kept[i])
+	}
 	return kept
 }
 
@@ -192,7 +238,13 @@ func CompactReviewSessions(entries []reviewSession) []reviewSession {
 // persists the compacted list. It rejects entries that exceed the per-line
 // size cap so callers know the session cannot be recovered, instead of
 // writing a line that LoadReviewSessions would silently skip.
-func UpsertReviewSession(path string, entry reviewSession) error {
+func UpsertReviewSession(path string, entry reviewSession, repoRoot string) error {
+	secret, err := repoSecret(repoRoot)
+	if err != nil {
+		return err
+	}
+	// Add MAC to entry first, then check size
+	entry.MAC = computeSessionMAC(secret, &entry)
 	b, err := json.Marshal(entry)
 	if err != nil {
 		return err
@@ -200,7 +252,7 @@ func UpsertReviewSession(path string, entry reviewSession) error {
 	if len(b) > sessionMaxSize {
 		return fmt.Errorf("review session entry too large (%d bytes, limit %d)", len(b), sessionMaxSize)
 	}
-	entries, err := LoadReviewSessions(path)
+	entries, err := LoadReviewSessions(path, repoRoot)
 	if err != nil {
 		return err
 	}
@@ -215,12 +267,12 @@ func UpsertReviewSession(path string, entry reviewSession) error {
 	if !replaced {
 		entries = append(entries, entry)
 	}
-	return SaveReviewSessions(path, CompactReviewSessions(entries))
+	return SaveReviewSessions(path, CompactReviewSessions(entries, repoRoot), repoRoot)
 }
 
 // DeleteReviewSession removes the entry with the given ID.
-func DeleteReviewSession(path, id string) error {
-	entries, err := LoadReviewSessions(path)
+func DeleteReviewSession(path, id string, repoRoot string) error {
+	entries, err := LoadReviewSessions(path, repoRoot)
 	if err != nil || len(entries) == 0 {
 		return err
 	}
@@ -236,13 +288,13 @@ func DeleteReviewSession(path, id string) error {
 	if !removed {
 		return nil
 	}
-	return SaveReviewSessions(path, kept)
+	return SaveReviewSessions(path, kept, repoRoot)
 }
 
 // FindReviewSession returns the session whose ID starts with shortID.
 // It fails when no entry matches or the prefix is ambiguous.
-func FindReviewSession(path, shortID string) (*reviewSession, error) {
-	entries, err := LoadReviewSessions(path)
+func FindReviewSession(path, shortID string, repoRoot string) (*reviewSession, error) {
+	entries, err := LoadReviewSessions(path, repoRoot)
 	if err != nil {
 		return nil, err
 	}
