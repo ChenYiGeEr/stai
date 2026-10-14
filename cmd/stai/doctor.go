@@ -5,6 +5,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -96,7 +97,30 @@ func cmdDoctor(args []string) {
 			exe = resolved
 		}
 	}
-	if count, err := countSourceTreeActions(exe); err == nil {
+	// Also check common symlink location (~/.local/bin/stai) in case actions.plist
+	// was registered with the symlink path instead of the resolved binary path.
+	var symlinkPath string
+	home, _ := os.UserHomeDir()
+	if home != "" {
+		symlinkPath = filepath.Join(home, ".local", "bin", "stai")
+		if fi, err := os.Lstat(symlinkPath); err == nil && fi.Mode()&os.ModeSymlink != 0 {
+			target, _ := os.Readlink(symlinkPath)
+			// Resolve relative target to absolute path for comparison
+			if !filepath.IsAbs(target) {
+				target = filepath.Join(filepath.Dir(symlinkPath), target)
+				target, _ = filepath.EvalSymlinks(target)
+			}
+			// Only use it if it points to our executable
+			if target == exe {
+				// symlinkPath is valid
+			} else {
+				symlinkPath = ""
+			}
+		} else {
+			symlinkPath = ""
+		}
+	}
+	if count, err := countSourceTreeActions(exe, symlinkPath); err == nil {
 		ok(fmt.Sprintf(i18n.T("doctor_actions_count"), count))
 	} else {
 		warn(fmt.Sprintf(i18n.T("doctor_actions_error"), err))
@@ -121,8 +145,10 @@ func infof(msg string) { fmt.Printf("  %s %s\n", color.Gray("[i]"), msg) }
 
 // countSourceTreeActions returns how many stai entries are present in
 // SourceTree's actions.plist without modifying the file.
-func countSourceTreeActions(exe string) (int, error) {
-	cmd := utf8Cmd("osascript", "-l", "JavaScript", "-e", countActionsPlistJXA, "--", exe)
+func countSourceTreeActions(exe string, extraPaths ...string) (int, error) {
+	args := []string{"osascript", "-l", "JavaScript", "-e", countActionsPlistJXA, "--", exe}
+	args = append(args, extraPaths...)
+	cmd := utf8Cmd(args[0], args[1:]...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
 		return 0, fmt.Errorf("%v: %s", err, strings.TrimSpace(string(out)))
@@ -130,10 +156,14 @@ func countSourceTreeActions(exe string) (int, error) {
 	return strconv.Atoi(strings.TrimSpace(string(out)))
 }
 
-// countActionsPlistJXA counts entries whose target equals argv[0].
+// countActionsPlistJXA counts entries whose target matches any of argv[0..n].
+// argv[0] = resolved exe path, argv[1..] = additional paths to match (e.g., symlink paths).
 const countActionsPlistJXA = `function run(argv) {
 	ObjC.import('Foundation');
-	var exe = argv[0];
+	var targets = [];
+	for (var i = 0; i < argv.length; i++) {
+		if (argv[i] && argv[i].length > 0) targets.push(argv[i]);
+	}
 	var path = $.NSHomeDirectory().stringByAppendingPathComponent('Library/Application Support/SourceTree/actions.plist');
 	var fm = $.NSFileManager.defaultManager;
 	if (!fm.fileExistsAtPath(path)) return '0';
@@ -150,7 +180,11 @@ const countActionsPlistJXA = `function run(argv) {
 	for (var i = 0; i < list.count; i++) {
 		var d = list.objectAtIndex(i);
 		var t = d.objectForKey('target');
-		if (t && t.isEqualToString(exe)) count++;
+		if (t) {
+			for (var j = 0; j < targets.length; j++) {
+				if (t.isEqualToString(targets[j])) { count++; break; }
+			}
+		}
 	}
 	return '' + count;
 }`
