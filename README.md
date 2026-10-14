@@ -47,7 +47,7 @@ CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查�
 在仓库根目录执行（全局安装后，任意仓库都可以运行）：
 
 ```bash
-stai install                  # 首次运行会启动配置向导;写入三个钩子 + 注册 SourceTree 自定义动作
+stai install                  # 首次运行会启动配置向导;写入三个钩子 + 注册 SourceTree 自定义操作
 stai install -no-sourcetree   # 只装钩子，不动 SourceTree
 stai uninstall                # 移除 install 写入的一切（只删 stai 自己写的）
 stai config                   # 重新运行配置向导（旧配置自动备份为 .bak）
@@ -60,7 +60,7 @@ stai mcp                      # 以 MCP server (stdio) 暴露 review 能力,供 
 
 1. 如果全局配置文件 `~/.config/stai/config.toml` 不存在且运行在交互式终端中，
    会先通过向导让你选择语言、填写 provider 地址/密钥、从 `/models` 接口选择模型，
-   并选择要注册的 SourceTree 自定义动作（可全部或部分），最后生成配置文件；
+   并选择要注册的 SourceTree 自定义操作（可全部或部分），最后生成配置文件；
 2. 向当前仓库写入 `prepare-commit-msg` 钩子（空提交信息时自动生成，绝不阻断提交）；
 3. 向当前仓库写入 `pre-commit` 钩子（仅在 `review.strict = true` 时审查并阻断高危提交，
    其余情况直接放行）；
@@ -81,7 +81,7 @@ stai mcp                      # 以 MCP server (stdio) 暴露 review 能力,供 
    （`$REPO` 由 SourceTree 展开为仓库路径；快捷键可在 SourceTree 设置 → 自定义操作中修改。）
 
 `uninstall` 在交互式终端中会询问是否删除全局配置文件，并总是删除诊断日志文件、
-钩子和 SourceTree 自定义动作。`install` 与 `uninstall` 都是幂等的：install 替换指向本二进制或同名的旧条目；
+钩子和 SourceTree 自定义操作。`install` 与 `uninstall` 都是幂等的：install 替换指向本二进制或同名的旧条目；
 uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动作条目，
 其他工具创建的内容原样保留。
 

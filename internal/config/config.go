@@ -931,7 +931,7 @@ model = %q
 # subtitle = ""
 
 [sourcetree]
-# SourceTree 自定义动作菜单文案与快捷键
+# SourceTree 自定义操作菜单文案与快捷键
 # action_caption = "AI 生成提交信息"
 # shortcut_key_code = 5
 # shortcut_modifiers = 524288
