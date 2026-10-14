@@ -60,8 +60,25 @@ func cmdDoctor(args []string) {
 	cancel()
 	if err == nil {
 		ok(fmt.Sprintf(i18n.T("doctor_provider_ok"), len(models)))
+
+		// Model validity: check if configured model is in the provider's model list
+		if cfg.Provider.Model != "" {
+			found := false
+			for _, m := range models {
+				if m == cfg.Provider.Model {
+					found = true
+					break
+				}
+			}
+			if found {
+				ok(fmt.Sprintf(i18n.T("doctor_model_ok"), cfg.Provider.Model))
+			} else {
+				warn(fmt.Sprintf(i18n.T("doctor_model_warn"), cfg.Provider.Model))
+			}
+		}
 	} else {
 		fail(fmt.Sprintf(i18n.T("doctor_provider_fail"), err))
+		infof(i18n.T("doctor_model_skip"))
 	}
 
 	// Git repo
