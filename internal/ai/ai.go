@@ -5,6 +5,7 @@
 package ai
 
 import (
+	"bufio"
 	"bytes"
 	"context"
 	"crypto/rand"
@@ -146,6 +147,87 @@ func (c *Client) chat(ctx context.Context, messages []chatMessage, seed *int64) 
 		return "", fmt.Errorf("provider returned an empty completion")
 	}
 	return out.Choices[0].Message.Content, nil
+}
+
+// ChatTTFT sends a streaming request and returns the time to first token (TTFT)
+// in milliseconds, along with the full response. Uses a minimal test prompt.
+func (c *Client) ChatTTFT(ctx context.Context) (int64, string, error) {
+	messages := []chatMessage{
+		{Role: "user", Content: "Reply with exactly: ok"},
+	}
+	body, err := json.Marshal(chatRequest{
+		Model:       c.model,
+		Messages:    messages,
+		Temperature: c.Temperature,
+		Stream:      true,
+		Seed:        nil,
+	})
+	if err != nil {
+		return 0, "", err
+	}
+
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		c.baseURL+"/chat/completions", bytes.NewReader(body))
+	if err != nil {
+		return 0, "", err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "stai/1.0")
+	req.Header.Set("x-opencode-session", c.sessionID)
+	if c.apiKey != "" {
+		req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	}
+	req.Header.Set("Accept", "text/event-stream")
+
+	start := time.Now()
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return 0, "", fmt.Errorf("calling %s: %w", c.baseURL, err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		return 0, "", fmt.Errorf("provider returned %s: %s", resp.Status, strings.TrimSpace(string(data)))
+	}
+
+	var ttft int64
+	var fullResponse strings.Builder
+	scanner := bufio.NewScanner(resp.Body)
+	scanner.Buffer(make([]byte, 4096), 1<<20) // handle long SSE data lines
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data: ") {
+			continue
+		}
+		data := strings.TrimPrefix(line, "data: ")
+		if data == "[DONE]" {
+			break
+		}
+		var chunk struct {
+			Choices []struct {
+				Delta struct {
+					Content string `json:"content"`
+				} `json:"delta"`
+			} `json:"choices"`
+		}
+		if err := json.Unmarshal([]byte(data), &chunk); err != nil {
+			continue
+		}
+		if len(chunk.Choices) > 0 && chunk.Choices[0].Delta.Content != "" {
+			if ttft == 0 {
+				ttft = time.Since(start).Milliseconds()
+			}
+			fullResponse.WriteString(chunk.Choices[0].Delta.Content)
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return 0, "", err
+	}
+	if ttft == 0 {
+		return 0, "", fmt.Errorf("no content received in stream")
+	}
+	return ttft, fullResponse.String(), nil
 }
 
 func (c *Client) warnSeedIgnored() {

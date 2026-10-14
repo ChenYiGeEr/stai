@@ -55,6 +55,7 @@ func cmdDoctor(args []string) {
 
 	// Provider reachability
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model, 10*time.Second)
+	client.Temperature = cfg.Provider.Temperature
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	models, err := client.ListModels(ctx)
 	cancel()
@@ -74,6 +75,18 @@ func cmdDoctor(args []string) {
 				ok(fmt.Sprintf(i18n.T("doctor_model_ok"), cfg.Provider.Model))
 			} else {
 				warn(fmt.Sprintf(i18n.T("doctor_model_warn"), cfg.Provider.Model))
+			}
+		}
+
+		// Model responsiveness: measure time to first token (TTFT)
+		if cfg.Provider.Model != "" {
+			ttftCtx, ttftCancel := context.WithTimeout(context.Background(), 10*time.Second)
+			ttft, _, ttftErr := client.ChatTTFT(ttftCtx)
+			ttftCancel()
+			if ttftErr == nil {
+				ok(fmt.Sprintf(i18n.T("doctor_ttft_ok"), ttft))
+			} else {
+				warn(fmt.Sprintf(i18n.T("doctor_ttft_fail"), ttftErr))
 			}
 		}
 	} else {
