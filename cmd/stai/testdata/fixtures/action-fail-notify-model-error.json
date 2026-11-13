@@ -1,0 +1,14 @@
+{
+  "id": "action-fail-notify-model-error",
+  "command": "stai gen",
+  "exit_code": 1,
+  "stderr": "stai: provider returned 500 Internal Server Error: model exploded\n",
+  "notification": {
+    "title": "stai",
+    "subtitle": "",
+    "body": "stai: provider returned 500 Internal Server Error: model exploded"
+  },
+  "stage": true,
+  "model": "error",
+  "notes": "Provider HTTP 500. stderr and the notification body are the same existing fatal sentence. No output window is opened."
+}

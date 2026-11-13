@@ -76,8 +76,8 @@ func cmdInstall(args []string) {
 		{
 			"prepare-commit-msg",
 			fmt.Sprintf(`#!/bin/sh
-# installed by stai — fills in an AI-generated message when the commit
-# message is left empty. Never blocks a commit.
+# installed by stai — when the commit message file is empty, writes an
+# AI-generated message into that file. Never blocks a commit.
 %s hook prepare-commit-msg "$@" || exit 0
 `, quotedExe),
 		},

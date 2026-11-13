@@ -1,0 +1,12 @@
+{
+  "id": "hook-notify-skip-empty-index",
+  "command": "stai hook prepare-commit-msg <msg-file>",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "stage": false,
+  "model": "none",
+  "notes": "Nothing staged. The message file is left as-is and no notification is sent."
+}

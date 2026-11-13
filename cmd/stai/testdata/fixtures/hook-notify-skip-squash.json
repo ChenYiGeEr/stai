@@ -1,0 +1,13 @@
+{
+  "id": "hook-notify-skip-squash",
+  "command": "stai hook prepare-commit-msg <msg-file> squash",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "source": "squash",
+  "stage": true,
+  "model": "none",
+  "notes": "source=squash is a listed skip. No notification. The AC proof list names the other skips; this fixture locks squash the same way."
+}

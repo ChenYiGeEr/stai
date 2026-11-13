@@ -13,13 +13,40 @@ import (
 	"stai/internal/i18n"
 )
 
+// exitFunc is os.Exit in production. Tests replace it to observe the code.
+var exitFunc = os.Exit
+
 // fatal prints the error to stderr and exits with code 1.
 func fatal(err error) {
 	if err != nil {
 		logf("error: %v", err)
 		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
-		os.Exit(1)
+		exitFunc(1)
 	}
+}
+
+// actionNotifyErr prints an existing error sentence and sends that same
+// sentence through the existing notification channel (see notifyScript).
+// It does not open a window and does not add a channel.
+func actionNotifyErr(title, sentence string) {
+	fmt.Fprintln(os.Stderr, sentence)
+	notify(title, "", sentence)
+}
+
+// actionExit is actionNotifyErr followed by exitFunc(code).
+func actionExit(title, sentence string, code int) {
+	actionNotifyErr(title, sentence)
+	exitFunc(code)
+}
+
+// actionFatal notifies with the same sentence fatal prints, then exits 1.
+// A nil err does nothing.
+func actionFatal(title string, err error) {
+	if err == nil {
+		return
+	}
+	notify(title, "", fmt.Sprintf("stai: %v", err))
+	fatal(err)
 }
 
 // utf8Cmd builds a command that runs with a UTF-8 locale. SourceTree starts

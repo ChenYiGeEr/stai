@@ -8,13 +8,26 @@ import (
 	"stai/internal/i18n"
 )
 
+// notifyScript is the existing notification channel: osascript
+// `display notification`, no buttons, and it does not take focus.
+// Success and failure of custom actions, and the prepare-commit-msg
+// after-the-fact note, all use this script. There is no second channel.
+const notifyScript = `on run argv
+	display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
+end run`
+
+// notifySink, when non-nil, receives the notification instead of osascript.
+// Production leaves it nil. Tests set it to record title, subtitle, and body.
+var notifySink func(title, subtitle, body string)
+
 // notify shows a macOS notification. Best-effort: a failure must never
 // break the workflow.
 func notify(title, subtitle, body string) {
-	script := `on run argv
-	display notification (item 1 of argv) with title (item 2 of argv) subtitle (item 3 of argv)
-end run`
-	cmd := utf8Cmd("osascript", "-e", script, "--", body, title, subtitle)
+	if notifySink != nil {
+		notifySink(title, subtitle, body)
+		return
+	}
+	cmd := utf8Cmd("osascript", "-e", notifyScript, "--", body, title, subtitle)
 	_ = cmd.Run()
 }
 

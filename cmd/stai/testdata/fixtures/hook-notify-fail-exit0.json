@@ -1,0 +1,16 @@
+{
+  "id": "hook-notify-fail-exit0",
+  "command": "stai hook prepare-commit-msg <msg-file>",
+  "exit_code": 0,
+  "stderr": "stai: commit message generation failed, committing as-is: provider returned 500 Internal Server Error: model exploded\n",
+  "notification": {
+    "title": "stai",
+    "subtitle": "",
+    "body": "stai: commit message generation failed, committing as-is: provider returned 500 Internal Server Error: model exploded"
+  },
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "stage": true,
+  "model": "error",
+  "notes": "Generation failure notifies with the existing hook_msg_gen_failed sentence and exits 0. The message file is not replaced, so an empty commit the user already confirmed can still land."
+}

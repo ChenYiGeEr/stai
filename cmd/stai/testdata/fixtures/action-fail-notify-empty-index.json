@@ -1,0 +1,14 @@
+{
+  "id": "action-fail-notify-empty-index",
+  "command": "stai gen",
+  "exit_code": 1,
+  "stderr": "stai: 暂存区没有改动\n",
+  "notification": {
+    "title": "stai",
+    "subtitle": "",
+    "body": "stai: 暂存区没有改动"
+  },
+  "stage": false,
+  "model": "none",
+  "notes": "Empty index. The notification body is the existing staged_empty sentence (with the same stai: prefix stderr already prints). Show Full Output is not opened; the channel is osascript display notification."
+}

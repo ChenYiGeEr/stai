@@ -1,0 +1,13 @@
+{
+  "id": "hook-notify-skip-merge",
+  "command": "stai hook prepare-commit-msg <msg-file> merge",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "source": "merge",
+  "stage": true,
+  "model": "none",
+  "notes": "source=merge skips before generation. No notification."
+}

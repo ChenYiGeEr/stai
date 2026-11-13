@@ -15,10 +15,12 @@ import (
 	"stai/internal/i18n"
 )
 
-// cmdHook is the entrypoint git hooks call. prepare-commit-msg fills in a
-// generated message when the commit box is left empty (never blocks); the
-// strict-mode pre-commit gate blocks only on high-severity findings when
-// review.strict is enabled.
+// cmdHook is the entrypoint git hooks call. prepare-commit-msg writes a
+// generated message into the git message file when that file is still empty
+// (the CLI fallback). On SourceTree 4.2.19 (macOS) the main path is
+// ⌥G → notification → Cmd+V in the commit box; opening the commit box does
+// not run this hook. Failure exits 0. The strict-mode pre-commit gate blocks
+// only on high-severity findings when review.strict is enabled.
 func cmdHook(args []string) {
 	fs := flag.NewFlagSet("hook", flag.ExitOnError)
 	fs.Parse(args)
@@ -39,9 +41,12 @@ func cmdHook(args []string) {
 	}
 }
 
-// hookPrepareCommitMsg fills in a generated message only when the user left
-// the commit message empty. It must never block a commit, so every failure
-// path exits 0.
+// hookPrepareCommitMsg writes a generated message into msgFile only when the
+// file has no commit message yet. It must never block a commit, so every
+// failure path exits 0. After the generated text is actually written, it
+// posts one non-focus-stealing notification. Skip paths stay silent. A
+// failed generation leaves the message file untouched, so an empty commit
+// the user already confirmed can still land.
 func hookPrepareCommitMsg(msgFile, source string) {
 	if os.Getenv("STAI_DISABLE") != "" {
 		return
@@ -72,7 +77,7 @@ func hookPrepareCommitMsg(msgFile, source string) {
 
 	cfg, err := config.Load()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf("stai: %v", err))
 		return
 	}
 	setLangFromConfig(cfg)
@@ -82,7 +87,7 @@ func hookPrepareCommitMsg(msgFile, source string) {
 	diff, err := git.StagedDiff()
 	if err != nil {
 		logf("hook prepare-commit-msg: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf("stai: %v", err))
 		return
 	}
 	if len(bytes.TrimSpace(diff)) == 0 {
@@ -95,14 +100,16 @@ func hookPrepareCommitMsg(msgFile, source string) {
 	msg, err := generate(ctx, cfg, diff)
 	if err != nil {
 		logf("hook prepare-commit-msg: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: "+i18n.T("hook_msg_gen_failed")+"\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf("stai: "+i18n.T("hook_msg_gen_failed"), err))
 		return
 	}
 	logf("hook prepare-commit-msg message=%q", msg)
 	if err := os.WriteFile(msgFile, []byte(msg+"\n"), 0o644); err != nil {
 		logf("hook prepare-commit-msg: %v", err)
-		fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf("stai: %v", err))
+		return
 	}
+	notify(cfg.Notify.Title, "", i18n.T("hook_notify_written"))
 }
 
 // hookPreCommit implements the strict-mode pre-commit gate (M2). It only
