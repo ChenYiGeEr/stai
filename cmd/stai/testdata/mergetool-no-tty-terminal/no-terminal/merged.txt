@@ -1,0 +1,17 @@
+alpha
+<<<<<<< HEAD
+OURS-1
+=======
+THEIRS-1
+>>>>>>> topic
+gap-a
+gap-b
+gap-c
+gap-d
+gap-e
+<<<<<<< HEAD
+OURS-2
+=======
+THEIRS-2
+>>>>>>> topic
+omega

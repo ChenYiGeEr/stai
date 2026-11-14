@@ -16,8 +16,8 @@ import (
 )
 
 // cmdMergetool resolves one text file passed by git mergetool.
-// Install/uninstall registration and the no-TTY Terminal.app handoff are
-// separate groups of the 2026-11-12 slice and are intentionally not done here.
+// A real terminal runs the session here. Without a TTY, macOS opens
+// Terminal.app and this process only relays that session's exit code.
 func cmdMergetool(args []string) {
 	os.Exit(runMergetool(args, os.Stdin, os.Stdout, os.Stderr))
 }
@@ -43,6 +43,25 @@ func runMergetool(args []string, in io.Reader, stdout, stderr io.Writer) int {
 		fmt.Fprintln(stderr, i18n.T("mergetool_missing_merged"))
 		fs.Usage()
 		return 2
+	}
+
+	// SourceTree and git mergetool start this process with no TTY. Do not
+	// read keys or write $MERGED here. A macOS Terminal session does that
+	// and we relay its exit code. Any other system stops without writing.
+	inTerminal := os.Getenv("STAI_MERGETOOL_TERMINAL") == "1"
+	if inTerminal && !stdinIsTerminal(in) {
+		fmt.Fprintln(stderr, i18n.T("mergetool_terminal_not_tty"))
+		return 1
+	}
+	if !inTerminal && !stdinIsTerminal(in) {
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt)
+		defer stop()
+		code, err := launchMergetoolTerminal(ctx, *base, *local, *remote, *merged)
+		if err != nil {
+			fmt.Fprintf(stderr, i18n.T("mergetool_no_terminal")+"\n", err)
+			return 1
+		}
+		return code
 	}
 
 	cfg := loadConfig()
