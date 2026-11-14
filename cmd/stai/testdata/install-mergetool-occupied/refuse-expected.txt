@@ -1,0 +1,5 @@
+merge.tool=vimdiff
+mergetool.stai.trustExitCode=true
+!mergetool.stai.staiOwnsMergeTool
+!mergetool.stai.staiPreviousMergeTool
+!mergetool.stai.staiMergeToolScope

@@ -61,6 +61,41 @@ func TestLoadFileRejectsUnknownKeys(t *testing.T) {
 	}
 }
 
+func TestLoadFileIgnoresAutoApply(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "config.toml")
+	content := `
+[global]
+lang = "en"
+auto_apply = true
+
+[merge]
+auto_apply = true
+
+[mergetool]
+auto_apply = false
+
+[[review.rule]]
+include = ["*.go"]
+rules = ["keep this rule"]
+auto_apply = true
+`
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cfg := Default()
+	if err := loadFile(&cfg, path); err != nil {
+		t.Fatalf("auto_apply must be ignored: %v", err)
+	}
+	if cfg.Global.Lang != "en" {
+		t.Errorf("lang = %q", cfg.Global.Lang)
+	}
+	if len(cfg.Review.RuleSets) != 1 || len(cfg.Review.RuleSets[0].Rules) != 1 ||
+		cfg.Review.RuleSets[0].Rules[0] != "keep this rule" {
+		t.Errorf("review rule was disturbed: %+v", cfg.Review.RuleSets)
+	}
+}
+
 func TestLoadFileStripsTrailingComments(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "config.toml")

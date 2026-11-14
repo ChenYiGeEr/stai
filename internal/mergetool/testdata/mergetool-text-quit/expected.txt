@@ -1,0 +1,13 @@
+alpha
+ACCEPTED-Q1
+gap-a
+gap-b
+gap-c
+gap-d
+gap-e
+<<<<<<< HEAD
+OURS-2
+=======
+THEIRS-2
+>>>>>>> topic
+omega

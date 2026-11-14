@@ -1,0 +1,9 @@
+alpha
+OURS-1
+gap-a
+gap-b
+gap-c
+gap-d
+gap-e
+OURS-2
+omega

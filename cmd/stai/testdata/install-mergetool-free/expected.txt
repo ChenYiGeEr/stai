@@ -1,0 +1,5 @@
+merge.tool=stai
+mergetool.stai.trustExitCode=true
+mergetool.stai.staiOwnsMergeTool=true
+mergetool.stai.staiMergeToolScope=unset
+!mergetool.stai.staiPreviousMergeTool

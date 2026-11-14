@@ -1,0 +1,7 @@
+{
+  "hunks": [
+    {"explanation": "the first hunk can be merged", "choice": "merge", "resolution": "MERGED-1\n"},
+    {"explanation": "model prefers a merge the user will not take", "choice": "merge", "resolution": "SHOULD-NOT-APPLY-2\n"},
+    {"explanation": "model prefers a merge the user will not take", "choice": "merge", "resolution": "SHOULD-NOT-APPLY-3\n"}
+  ]
+}

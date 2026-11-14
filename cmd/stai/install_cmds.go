@@ -128,6 +128,14 @@ exit 0
 		fmt.Printf(i18n.T("install_hook_installed")+"\n", path)
 	}
 
+	repo, err := git.RepoRoot()
+	fatal(err)
+	var ask func(string) bool
+	if isTerminal(os.Stdin.Fd()) {
+		ask = func(prompt string) bool { return confirm(prompt, false) }
+	}
+	fatal(installMergetool(repo, exe, ask))
+
 	if *noSourceTree {
 		return
 	}
@@ -201,6 +209,12 @@ func cmdUninstall(args []string) {
 			continue
 		}
 		fmt.Printf(i18n.T("install_hook_removed")+"\n", path)
+	}
+
+	if repo, err := git.RepoRoot(); err == nil {
+		if err := uninstallMergetool(repo); err != nil {
+			fmt.Fprintf(os.Stderr, "stai: %v\n", err)
+		}
 	}
 
 	if *noSourceTree {

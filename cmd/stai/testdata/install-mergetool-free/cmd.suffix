@@ -1,0 +1,1 @@
+mergetool --base "$BASE" --local "$LOCAL" --remote "$REMOTE" --merged "$MERGED"
