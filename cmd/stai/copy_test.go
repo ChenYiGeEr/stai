@@ -34,7 +34,7 @@ func TestAC1Copy(t *testing.T) {
 		"⌥G → 通知 → 提交框 Cmd+V",
 		"打开提交框不会运行 `prepare-commit-msg`",
 		"Empty Commit Message / 你没有填写提交说明",
-		"4.2.19（macOS）",
+		"4.2.20（macOS）",
 		"Windows 与更早版本不在本说明的核对范围内",
 		"命令行空信息提交（钩子写入 message 文件）",
 		"仍可能留下空提交",
@@ -48,7 +48,7 @@ func TestAC1Copy(t *testing.T) {
 		"⌥G → notification → Cmd+V in the commit box",
 		"Opening the commit box does not run `prepare-commit-msg`",
 		"Empty Commit Message / 你没有填写提交说明",
-		"4.2.19 (macOS)",
+		"4.2.20 (macOS)",
 		"Windows and older",
 		"CLI commit with an empty message file",
 		"an empty commit can still be left behind",
@@ -57,6 +57,12 @@ func TestAC1Copy(t *testing.T) {
 		if !strings.Contains(en, s) {
 			t.Errorf("README.en.md missing %q", s)
 		}
+	}
+	if strings.Contains(zh, "4.2.19") {
+		t.Error("README.md still locks a SourceTree check version to 4.2.19")
+	}
+	if strings.Contains(en, "4.2.19") {
+		t.Error("README.en.md still locks a SourceTree check version to 4.2.19")
 	}
 
 	var scanned []string

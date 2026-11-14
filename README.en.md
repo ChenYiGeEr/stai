@@ -34,7 +34,7 @@ variable overrides it temporarily.
 
 - macOS (the SourceTree integration relies on `osascript`, `pbcopy` and
   SourceTree's `actions.plist`);
-- SourceTree (verified on 4.2.19);
+- SourceTree (check version 4.2.20 (macOS));
 - Go 1.23+ (only for building from source);
 - An OpenAI-compatible model endpoint — local Ollama by default
   (`http://localhost:11434/v1`), LM Studio or API gateways work too.
@@ -101,9 +101,9 @@ entries — anything created by other tools is preserved.
 
 ## Usage
 
-### Custom actions (SourceTree 4.2.19 on macOS)
+### Custom actions (SourceTree 4.2.20 on macOS)
 
-Stage your changes in SourceTree 4.2.19 (macOS), then press **⌥G**
+Stage your changes in SourceTree 4.2.20 (macOS), then press **⌥G**
 (**Actions → Custom Actions → AI 生成提交信息**). The main path is
 **⌥G → notification → Cmd+V in the commit box**:
 
@@ -117,13 +117,14 @@ Opening the commit box does not run `prepare-commit-msg`. The window focus
 never changes; nothing is written into the commit box without your
 confirmation, and your existing draft is never overwritten.
 
-Committing from an empty box on SourceTree 4.2.19 (macOS) first shows the
+Committing from an empty box on SourceTree 4.2.20 (macOS) first shows the
 system warning "Empty Commit Message / 你没有填写提交说明". After you confirm
 that warning, git runs `prepare-commit-msg`. The hook writes the message
 file; the generated text does not show up in the commit box.
 
-These SourceTree statements are limited to 4.2.19 (macOS). Windows and older
-versions are outside what this document has checked.
+These SourceTree statements are limited to 4.2.20 (macOS). Windows and older
+versions are outside what this document has checked. Other unchecked versions
+are outside it as well.
 
 CLI equivalent: `stai gen`; `stai gen --edit` first shows an editable dialog
 and copies only after confirmation.

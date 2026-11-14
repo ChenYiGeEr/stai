@@ -17,7 +17,7 @@ import (
 
 // cmdHook is the entrypoint git hooks call. prepare-commit-msg writes a
 // generated message into the git message file when that file is still empty
-// (the CLI fallback). On SourceTree 4.2.19 (macOS) the main path is
+// (the CLI fallback). On SourceTree 4.2.20 (macOS) the main path is
 // ⌥G → notification → Cmd+V in the commit box; opening the commit box does
 // not run this hook. Failure exits 0. The strict-mode pre-commit gate blocks
 // only on high-severity findings when review.strict is enabled.

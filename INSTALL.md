@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/chenyiGeEr/stai/v0.1.0/install.sh |
 ## 前置条件
 
 - **macOS**（SourceTree 集成依赖 macOS 的 `osascript`、`pbcopy` 与 SourceTree 的 `actions.plist`）；
-- **SourceTree**（已在 4.2.19 上验证）；
+- **SourceTree**（核对版本为 4.2.20（macOS））；
 - **Go 1.23+**（one-liner、`go install` 和源码构建都需要）；
 - 一个 **OpenAI 兼容的模型服务**，默认为本机 Ollama（`http://localhost:11434/v1`），也可指向 LM Studio 或 API 网关。
 

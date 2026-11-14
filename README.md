@@ -38,7 +38,7 @@ CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查�
 ## 前置条件
 
 - macOS（SourceTree 集成依赖 macOS 的 `osascript`、`pbcopy` 与 SourceTree 的 `actions.plist`）；
-- SourceTree（已在 4.2.19 上验证）；
+- SourceTree（核对版本为 4.2.20（macOS））；
 - Go 1.23+（仅从源码构建时需要）；
 - 一个 OpenAI 兼容的模型服务，默认为本机 Ollama（`http://localhost:11434/v1`），也可指向 LM Studio 或网关。
 
@@ -90,9 +90,9 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 
 ## 使用方式
 
-### 自定义操作（SourceTree 4.2.19 macOS）
+### 自定义操作（SourceTree 4.2.20 macOS）
 
-在 SourceTree 4.2.19（macOS）里暂存改动，然后按 **⌥G**（**动作 → 自定义操作 → AI 生成提交信息**）。主路径是 **⌥G → 通知 → 提交框 Cmd+V**：
+在 SourceTree 4.2.20（macOS）里暂存改动，然后按 **⌥G**（**动作 → 自定义操作 → AI 生成提交信息**）。主路径是 **⌥G → 通知 → 提交框 Cmd+V**：
 
 1. 生成的说明复制到剪贴板，并用系统通知展示全文。通知不抢焦点。SourceTree 会丢弃自定义操作的标准输出，不看通知就看不到内容；
 2. 光标点在提交框中，按 Cmd+V 粘贴；
@@ -100,9 +100,9 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 
 打开提交框不会运行 `prepare-commit-msg`。全程不改变窗口焦点，不会未经确认就写入提交框，也不会覆盖你已写的草稿。
 
-提交框为空就点提交时，SourceTree 4.2.19（macOS）会先弹出系统警告「Empty Commit Message / 你没有填写提交说明」。用户确认之后，git 才运行 `prepare-commit-msg`。钩子此时写入的是 message 文件，生成的说明不会出现在提交框里。
+提交框为空就点提交时，SourceTree 4.2.20（macOS）会先弹出系统警告「Empty Commit Message / 你没有填写提交说明」。用户确认之后，git 才运行 `prepare-commit-msg`。钩子此时写入的是 message 文件，生成的说明不会出现在提交框里。
 
-以上 SourceTree 行为仅限 4.2.19（macOS）。Windows 与更早版本不在本说明的核对范围内。
+以上 SourceTree 行为仅限 4.2.20（macOS）。Windows 与更早版本不在本说明的核对范围内。其他未验证版本同样不在核对范围内。
 
 等价命令行：`stai gen`；`stai gen --edit` 会先弹出可编辑对话框，确认后再复制。
 

@@ -48,7 +48,7 @@ curl -fsSL https://raw.githubusercontent.com/chenyiGeEr/stai/v0.1.0/install.sh |
 ## Prerequisites
 
 - **macOS** (the SourceTree integration relies on `osascript`, `pbcopy`, and SourceTree's `actions.plist`);
-- **SourceTree** (verified on 4.2.19);
+- **SourceTree** (check version 4.2.20 (macOS));
 - **Go 1.23+** (required by the one-liner, `go install`, and source builds);
 - An **OpenAI-compatible model endpoint** — local Ollama by default (`http://localhost:11434/v1`), LM Studio or API gateways work too.
 

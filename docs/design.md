@@ -1,3 +1,89 @@
+# stai 绑定切片 2026-11-14：SourceTree 核对版本改为 4.2.20
+
+Decision needed: approve this cut | reject a listed out item.
+
+- 产品：stai（CLI + SourceTree 4.2.20 macOS 自定义操作与 Git 钩子）
+- 日期：2026-11-14（亚洲/上海）
+- 状态：已批准。日期：2026-11-14（亚洲/上海）。
+- 与既有切片的关系：本切片是对已批准的「stai 绑定切片 2026-11-13：SourceTree 现有交互（摆放、反馈、说法）」的中途范围变更。原因：机主本机 SourceTree 已更新到 4.2.20（build 324，路径 `/Applications/Sourcetree.app`，机主已确认），而 2026-11-13 切片把核对版本锁在 4.2.19。本切片不替代 2026-11-13 全文；2026-11-13 的范围内/范围外与 AC 仍有效，仅下列条款以本切片为准：（1）核对与验收版本改为 4.2.20（macOS）；（2）AC-4 类型对照样本改在 4.2.20 界面手动勾选并保存后采集；（3）文档中将行为或支持范围锁在 4.2.19 的表述改为 4.2.20。禁止用聊天修改已批准的 2026-11-13 正文，或用聊天改本切片范围。本切片不替代、不修改、不推进「stai 绑定切片 2026-11-12：文本冲突 mergetool」。
+- 活文档：仓库内 `docs/design.md`（本切片与 2026-11-13 一并作为 PM 结论优先）；批准后将本切片置于该文档顶部（或所有者指定的切片路径），并保留 2026-11-13 切片，勿改写其正文。
+- 既有进度（本切片的前提，不在本切片里重做第 1 组行为验收）：第 1 组 AC-1/2/3 已由 QA 在 SHA `7d6c140ab0cc7a41b197074f8768eacca4623e30`、[PR #1](https://github.com/ChenYiGeEr/stai/pull/1) 上全部 PASS；当时文档与截图按 4.2.19 表述。第 2 组（AC-4/AC-5）此前已批准开工，但停在 AC-4 解锁门槛。
+
+## 成功标准
+
+Decision needed: approve this cut.
+
+在机主本机 SourceTree 4.2.20（macOS，build 324）上完成 2026-11-13 第 2、3 组验收：上下文矩阵与类型写入与 4.2.20 界面保存样本字节级一致；长文可在已有 Show Full Output 窗口读完；`install` / `doctor` 按原锁检查。产品文档将本工作的核对版本写为 4.2.20（macOS），不再写成仅限或锁定 4.2.19。第 1 组已 PASS 的行为结论保留。不自动改工作区或提交框，AI 故障不阻断提交或推送。
+
+## 范围内
+
+Decision needed: approve this in-list.
+
+- 核对版本改为 SourceTree 4.2.20（macOS）。文档、注释、i18n 以及本工作相关说明中，凡把 SourceTree 行为或支持/核对范围写成「仅限 4.2.19」「限定为 4.2.19」或同等表述的，改为 4.2.20（macOS）。仍不得推广到未验证的 Windows 或未验证的其他版本。2026-11-13 写明的主路径与警告保留：⌥G → 通知 → 提交框 Cmd+V；打开提交框不跑 `prepare-commit-msg`；空框点提交先出「Empty Commit Message / 你没有填写提交说明」；CLI 钩子兜底分节另述。上述界面行为在无新证据表明 4.2.20 不同的前提下仍作为本切片的指定行为；若验收时 4.2.20 的实际文案或时序不同，停止并报告，不得软通过，也不得用聊天改切片。
+- 第 1 组处理：AC-2、AC-3 的 PASS 结论保留，不因版本号变更而重跑或补审。AC-1 中除版本表述外的文案结论（不再出现「填入提交框」或 “fills in the commit box” 同类表述，主路径与警告、CLI 分节）保留，不重跑第 1 组行为验收。PR #1 / SHA `7d6c140` 上按 4.2.19 表述的文档与截图作为第 1 组历史证明保留，不必回改那次提交。第 2 组（AC-4/AC-5）与第 3 组（AC-6/AC-7）起，采集与验收一律在 4.2.20（macOS）上进行。
+- AC-4 类型对照样本改为：在 SourceTree 4.2.20 偏好设置中手动勾选对应上下文并保存后，采集写入的 `actions.plist` 条目（含字段类型）。不得用 4.2.20 样本冒充 4.2.19 样本，也不得用旧的 4.2.19 样本冒充 4.2.20 样本，不得猜测类型。
+- 以下锁死点在无新证据表明 4.2.20 行为不同的前提下保持不变，但仍须用 4.2.20 样本做字节级对照后再写入：2026-11-13 冻结的九条上下文矩阵；changelog 只开日志，不开仓库、也不开文件上下文；Show Full Output 为静态开关（`pr` / `split` / `changelog` 打开，`review` / `review-branch` / `explain` 保持开，`gen` / `pr-title` / `stash-msg` 保持关；不能按成功/失败切换）；不接 `$SHA`；全部动作 `separateWindow` 保持关；参数字符串不变；已有默认快捷键不变；explain 一次只选一个文件。若 4.2.20 样本显示类型或行为与预期冲突，停止并报告，不得猜、不得改矩阵、不得软通过。
+- `install` / `doctor` 的进程检测、警告并继续、doctor 核对矩阵、以及「动作全局、钩子按仓库安装」那一句，仍按 2026-11-13 锁死规则执行，并在 4.2.20 上验收。本切片不因安装路径为 `/Applications/Sourcetree.app` 而改进程名检测；仍只匹配进程名 `SourceTree`。若 4.2.20 的进程名不同，停止并报告，不得改检测方式、不得软通过。
+
+## 范围外
+
+Decision needed: reject a listed out item, or approve the out-list as written.
+
+- 重开或重跑已 PASS 的 AC-2、AC-3，或回改 SHA `7d6c140` / PR #1 的第 1 组历史证明。
+- 用 4.2.20 样本冒充 4.2.19，或在无 4.2.20 对照样本时猜测 `repoAction` / `fileAction` / `logAction` 类型并写入。
+- 在本切片批准前采集类型样本、改机主 `actions.plist`、或开始写入文档/安装逻辑。
+- 在无新证据时改冻结矩阵、打开 `separateWindow`、接 `$SHA`、把 changelog 开到仓库或文件、或改 Show Full Output 的静态开关策略。
+- mergetool、apply-fixes、split --apply、新 MCP 工具，以及任何对「stai 绑定切片 2026-11-12：文本冲突 mergetool」的范围改动或推进。
+- 2026-11-13 范围外已列明的其余项（提交模板、`sourcetree://`、默认 `gen --edit`、后六项默认快捷键、钩子自动改工作区或自动拆分、AI 故障阻断提交、禁止空提交、多文件 explain、新的失败弹窗通道、改成功路径的剪贴板/通知）仍为范围外。
+
+## 验收标准
+
+Decision needed: approve these ACs and the unlock order below.
+
+AC-8 文档核对版本改为 4.2.20（macOS）  
+Proof: SHA（改动后的 `README.md`、`README.en.md` 及被改到的注释/i18n/`docs/design.md`）+ screenshot（文档中写明核对或支持版本为 4.2.20 的表述）。  
+QA: pass if 本工作相关文档不再把 SourceTree 行为或支持/核对范围锁在 4.2.19，而是写为 4.2.20（macOS）；AC-1 已通过的文案结论未回退（无「填入提交框」或 “fills in the commit box” 同类表述；主路径、打开提交框不跑钩子、Empty Commit Message、CLI 分节仍在）；未推广到未验证的 Windows 或其他版本；未改写 PR #1 / SHA `7d6c140` 上的第 1 组历史证明。
+
+AC-4 上下文矩阵与 4.2.20 类型样本（修订 2026-11-13 的样本来源）  
+Proof: fixture id `sourcetree-4220-context-type-sample`（4.2.20 偏好设置中手动勾选文件/日志/仓库上下文并保存后的 `actions.plist` 条目摘录，含字段类型）+ fixture id `install-context-matrix`（安装后九条动作的 fileAction / logAction / repoAction / separateWindow / params）+ screenshot（文件状态、文件右键、日志右键、仓库右键中出现的 stai 项与矩阵一致）。  
+QA: pass if changelog 只开日志、仓库与文件均为关；其余八条与 2026-11-13 范围内表格一致；全部 `separateWindow` 为关；params 不含 `$SHA`；写入类型与本切片的 4.2.20 对照样本字节级一致；explain 文案写清一次只选一个文件；未新增默认快捷键；样本明确来自 4.2.20，不是 4.2.19 样本的重贴。
+
+AC-5 长文打开 Show Full Output，短文成功仍无窗  
+Proof: fixture id `actions-show-full-output`（九条动作的 showFullOutput 值）+ screenshot（在 4.2.20 上：`pr` / `split` / `changelog` 成功后出现输出窗口且含全文；`gen` / `pr-title` / `stash-msg` 成功后无该窗口）。  
+QA: pass if 与 2026-11-13 AC-5 相同的开/关矩阵成立；短文成功无窗；未按退出码切换该开关；验收在 4.2.20 上进行。
+
+AC-6 SourceTree 正在运行时警告并继续  
+Proof: fixture id `install-doctor-sourcetree-running`、`install-doctor-sourcetree-quit`（检测所用进程名、完整警告原文、退出码）+ screenshot（在 4.2.20 仍运行时，交互式 install 的显眼警告）。  
+QA: pass if 与 2026-11-13 AC-6 相同：进程名为 `SourceTree` 的进程在跑时警告并继续写入；未在跑时不发这条警告；检测只按进程名 `SourceTree`；验收在 4.2.20 上进行。
+
+AC-7 doctor 核对矩阵并说明安装范围  
+Proof: fixture id `doctor-matrix-ok`、`doctor-matrix-mismatch`（故意改错一条开关后的 doctor 输出）+ screenshot 或完整 doctor 输出文本。  
+QA: pass if 与 2026-11-13 AC-7 相同，且矩阵对照的是本切片修订后的写入结果；验收在 4.2.20 上进行。
+
+AC-2、AC-3 不在本切片重开。第 1 组 PASS 记录：SHA `7d6c140ab0cc7a41b197074f8768eacca4623e30`，[PR #1](https://github.com/ChenYiGeEr/stai/pull/1)。
+
+## 解锁顺序
+
+Decision needed: approve this unlock order.
+
+本切片批准前：不得采集、不得改机主 `actions.plist`、不得开始写入，不得打开 Cloud Agent。
+
+1. AC-8（文档版本表述）可在批准后立即开始；不重开 AC-2/AC-3。AC-8 须 PASS，本切片才算文档部分完成。
+2. 然后继续 2026-11-13 第 2 组：先完成 AC-4 的 4.2.20 类型对照样本，再按矩阵写入；随后 AC-5。不得在样本完成前写入矩阵。
+3. 然后第 3 组：AC-6、AC-7。
+
+AC-8 与 AC-4/5/6/7 全部 PASS 之前，本切片不算完成，不得把未完成项软通过。本切片不解锁、不开始 mergetool 或任何范围外工作。若 4.2.20 出现与锁死点不符的新证据，停止并回到所有者出新的注明日期切片，禁止用聊天改范围。
+
+## 交接
+
+Decision needed: approve this handoff. Eng/QA 角色尚未命名。
+
+- **Eng：** 切片路径为仓库外草案 `/workspace/stai-prd-cuts/2026-11-14-sourcetree-4220.md`；批准后写入 `docs/design.md` 顶部或所有者指定的切片路径，并保留 2026-11-13 切片正文不改写。日期 2026-11-14。按解锁顺序实现 AC-8，然后 AC-4（先样本后写入）→ AC-5，然后 AC-6 → AC-7。证明按各 AC 的 Proof 提交。批准前不要打开 Cloud Agent，不要采集样本，不要改机主 `actions.plist`，不要开始写入。
+- **QA：** 只按本切片与仍有效的 2026-11-13 条款改写验收包；第 1 组 AC-2/AC-3 不重跑；AC-8 与修订后的 AC-4/5/6/7 按本切片验收；禁止软通过；使用同一 Proof 表。
+- 所有者：批准后，hand this cut to your Eng when ready。2026-11-12 mergetool 切片仍为草案、仍暂停，不随本切片一起交给工程，除非所有者另决并先批准那一份。
+
+---
+
 # stai 绑定切片 2026-11-13：SourceTree 现有交互（摆放、反馈、说法）
 
 Decision needed: approve this cut | reject a listed out item.
@@ -111,7 +197,7 @@ Decision needed: approve this handoff. Eng/QA 角色尚未命名。
 
 ## 为什么不是插件
 
-关键事实（已在安装于本机的 Sourcetree 4.2.19 上验证）：
+关键事实（无插件机制的检查记录来自当时安装的 Sourcetree 4.2.19；本工作的 SourceTree 行为核对版本是 4.2.20（macOS））：
 
 - SourceTree **没有任何插件机制**——自带 framework 只有 Sparkle（自动更新）和
   CocoaLumberjack（日志），二进制中没有插件加载点；
