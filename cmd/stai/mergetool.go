@@ -17,7 +17,8 @@ import (
 
 // cmdMergetool resolves one text file passed by git mergetool.
 // A real terminal runs the session here. Without a TTY, macOS opens
-// Terminal.app and this process only relays that session's exit code.
+// Terminal.app on a .command file and this process only relays that
+// session's exit code.
 func cmdMergetool(args []string) {
 	os.Exit(runMergetool(args, os.Stdin, os.Stdout, os.Stderr))
 }

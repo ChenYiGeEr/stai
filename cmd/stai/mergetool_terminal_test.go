@@ -185,9 +185,21 @@ func TestMergetoolTerminalCommandRecordsExit(t *testing.T) {
 			t.Fatalf("command %q missing %s", got, part)
 		}
 	}
-	quoted := osaString(`echo "$code"`)
-	if quoted != `"echo \"$code\""` {
-		t.Fatalf("osaString = %s", quoted)
+	script := mergetoolCommandScript("/opt/stai bin/stai", "/base file", "/local", "/remote", "/merged", "/status file")
+	if !strings.HasPrefix(script, "#!/bin/sh\n") {
+		t.Fatalf("script = %q", script)
+	}
+	if strings.Contains(script, "osascript") || strings.Contains(script, "tell application") {
+		t.Fatalf("script still sends Apple events:\n%s", script)
+	}
+	argv := terminalOpenArgv("/tmp/stai-mergetool.command")
+	if strings.Join(argv, " ") != "/usr/bin/open -a Terminal /tmp/stai-mergetool.command" {
+		t.Fatalf("open argv = %#v", argv)
+	}
+	for _, arg := range argv {
+		if strings.Contains(arg, "osascript") || strings.Contains(arg, "tell application") {
+			t.Fatalf("open argv uses Apple events: %#v", argv)
+		}
 	}
 }
 

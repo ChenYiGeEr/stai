@@ -45,11 +45,21 @@ func mergetoolTerminalCommand(exe, base, local, remote, merged, status string) s
 	}, " ")
 }
 
-// osaString quotes s for an AppleScript double-quoted string.
-func osaString(s string) string {
-	s = strings.ReplaceAll(s, `\`, `\\`)
-	s = strings.ReplaceAll(s, `"`, `\"`)
-	return `"` + s + `"`
+// mergetoolCommandScript is a Terminal .command file. Terminal.app executes
+// it as a document opened via Launch Services, so the window stays up for
+// the whole interactive session.
+func mergetoolCommandScript(exe, base, local, remote, merged, status string) string {
+	return "#!/bin/sh\n" + mergetoolTerminalCommand(exe, base, local, remote, merged, status) + "\n"
+}
+
+// terminalOpenArgv launches Terminal.app on a .command file. This is
+// /usr/bin/open, not an Apple event such as `tell application "Terminal"`.
+// SourceTree-started stai is a separate process; Apple events to Terminal
+// are refused silently (osascript -1743) when that process has no Automation
+// grant, and the window flashes closed. Opening a document does not ask
+// Terminal to be controlled.
+func terminalOpenArgv(scriptPath string) []string {
+	return []string{"/usr/bin/open", "-a", "Terminal", scriptPath}
 }
 
 func readMergetoolStatus(path string) (int, bool) {
