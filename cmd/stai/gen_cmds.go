@@ -40,26 +40,25 @@ func cmdGen(args []string) {
 	if repoDir == "" {
 		var err error
 		repoDir, err = os.Getwd()
-		fatal(err)
+		actionFatal(cfg.Notify.Title, err)
 	}
 	// Resolve to absolute path early for security
 	absRepoDir, err := filepath.Abs(repoDir)
 	if err != nil {
-		fatal(fmt.Errorf("resolve repo dir: %w", err))
+		actionFatal(cfg.Notify.Title, fmt.Errorf("resolve repo dir: %w", err))
 	}
 	repoDir = absRepoDir
 
 	diff, err := git.StagedDiffDir(repoDir)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("staged_empty"))
-		os.Exit(1)
+		actionExit(cfg.Notify.Title, "stai: "+i18n.T("staged_empty"), 1)
 	}
 
 	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
 	msg, err := generate(ctx, cfg, diff)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 
 	if *editFlag {
 		edited, ok := dialogEdit(msg)
@@ -73,7 +72,7 @@ func cmdGen(args []string) {
 	logf("gen repo=%s message=%q", repoDir, msg)
 	if err := writeClipboard(msg); err != nil {
 		logf("gen clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf(i18n.T("clipboard_failed"), err))
 		return
 	}
 	notifyCopied(cfg.Notify, msg)
@@ -163,18 +162,17 @@ func cmdPRTitle(args []string) {
 		repoDir = fs.Arg(0)
 	}
 	if fs.NArg() > 1 {
-		fmt.Fprintln(os.Stderr, i18n.T("usage_pr_title"))
-		os.Exit(2)
+		actionExit(cfg.Notify.Title, i18n.T("usage_pr_title"), 2)
 	}
 	if repoDir == "" {
 		var err error
 		repoDir, err = os.Getwd()
-		fatal(err)
+		actionFatal(cfg.Notify.Title, err)
 	}
 	// Resolve to absolute path early for security
 	absRepoDir, err := filepath.Abs(repoDir)
 	if err != nil {
-		fatal(fmt.Errorf("resolve repo dir: %w", err))
+		actionFatal(cfg.Notify.Title, fmt.Errorf("resolve repo dir: %w", err))
 	}
 	repoDir = absRepoDir
 
@@ -182,9 +180,9 @@ func cmdPRTitle(args []string) {
 	logf("pr-title start args=%q model=%s base_url=%s base=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL, baseRef)
 
 	diff, err := git.BranchDiffDir(repoDir, baseRef)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintf(os.Stderr, i18n.T("ahead_none")+"\n", baseRef)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf(i18n.T("ahead_none"), baseRef))
 		return
 	}
 
@@ -196,12 +194,12 @@ func cmdPRTitle(args []string) {
 	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
 	title, err := client.GeneratePRTitle(ctx, cfg.Commit, diff)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 
 	logf("pr-title repo=%s base=%s title=%q", repoDir, baseRef, title)
 	if err := writeClipboard(title); err != nil {
 		logf("pr-title clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf(i18n.T("clipboard_failed"), err))
 		return
 	}
 	notify(cfg.Notify.Title, i18n.T("notify_pr_title"), title)
@@ -225,22 +223,21 @@ func cmdStashMsg(args []string) {
 	if repoDir == "" {
 		var err error
 		repoDir, err = os.Getwd()
-		fatal(err)
+		actionFatal(cfg.Notify.Title, err)
 	}
 	// Resolve to absolute path early for security
 	absRepoDir, err := filepath.Abs(repoDir)
 	if err != nil {
-		fatal(fmt.Errorf("resolve repo dir: %w", err))
+		actionFatal(cfg.Notify.Title, fmt.Errorf("resolve repo dir: %w", err))
 	}
 	repoDir = absRepoDir
 
 	logf("stash-msg start args=%q model=%s base_url=%s", args, cfg.Provider.Model, cfg.Provider.BaseURL)
 
 	diff, err := git.WorkingTreeDiffDir(repoDir)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 	if len(bytes.TrimSpace(diff)) == 0 {
-		fmt.Fprintln(os.Stderr, "stai: "+i18n.T("worktree_empty"))
-		os.Exit(1)
+		actionExit(cfg.Notify.Title, "stai: "+i18n.T("worktree_empty"), 1)
 	}
 
 	client := ai.NewClient(cfg.Provider.BaseURL, cfg.Provider.APIKey, cfg.Provider.Model,
@@ -250,12 +247,12 @@ func cmdStashMsg(args []string) {
 	ctx, cancel := commandContext(context.Background(), time.Duration(cfg.Provider.TimeoutSec)*time.Second)
 	defer cancel()
 	msg, err := client.GenerateStashMsg(ctx, cfg.Commit, diff)
-	fatal(err)
+	actionFatal(cfg.Notify.Title, err)
 
 	logf("stash-msg repo=%s message=%q", repoDir, msg)
 	if err := writeClipboard(msg); err != nil {
 		logf("stash-msg clipboard write failed: %v", err)
-		fmt.Fprintf(os.Stderr, i18n.T("clipboard_failed")+"\n", err)
+		actionNotifyErr(cfg.Notify.Title, fmt.Sprintf(i18n.T("clipboard_failed"), err))
 		return
 	}
 	notify(cfg.Notify.Title, i18n.T("notify_stash"), msg)

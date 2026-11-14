@@ -1,0 +1,13 @@
+{
+  "id": "hook-notify-skip-disabled",
+  "command": "STAI_DISABLE=1 stai hook prepare-commit-msg <msg-file>",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "disable": true,
+  "stage": true,
+  "model": "none",
+  "notes": "STAI_DISABLE skips before generation. No notification."
+}

@@ -1,0 +1,21 @@
+{
+  "id": "hook-notify-written",
+  "command": "stai hook prepare-commit-msg <msg-file>",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": {
+    "title": "stai",
+    "subtitle": "",
+    "body": "这次提交用了生成的说明"
+  },
+  "notification_en": {
+    "title": "stai",
+    "subtitle": "",
+    "body": "This commit used a generated message"
+  },
+  "initial_message_file": "# Please enter the commit message.\n",
+  "message_file": "feat: 增加说明\n",
+  "stage": true,
+  "model": "ok",
+  "notes": "Comments-only message file counts as empty. The notification is sent only after the generated text is written. notification is zh-CN (default and [global] lang). notification_en is STAI_LANG=en and a config file with lang = \"en\"."
+}

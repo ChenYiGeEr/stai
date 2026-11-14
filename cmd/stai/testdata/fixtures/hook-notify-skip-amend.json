@@ -1,0 +1,13 @@
+{
+  "id": "hook-notify-skip-amend",
+  "command": "stai hook prepare-commit-msg <msg-file> commit",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "# comment only\n",
+  "message_file": "# comment only\n",
+  "source": "commit",
+  "stage": true,
+  "model": "none",
+  "notes": "amend is source == commit. No notification."
+}

@@ -38,7 +38,7 @@ CLI 文案、系统通知与 AI 产出物（commit message、PR 描述、审查�
 ## 前置条件
 
 - macOS（SourceTree 集成依赖 macOS 的 `osascript`、`pbcopy` 与 SourceTree 的 `actions.plist`）；
-- SourceTree（已在 4.2.19 上验证）；
+- SourceTree（核对版本为 4.2.20（macOS））；
 - Go 1.23+（仅从源码构建时需要）；
 - 一个 OpenAI 兼容的模型服务，默认为本机 Ollama（`http://localhost:11434/v1`），也可指向 LM Studio 或网关。
 
@@ -61,7 +61,7 @@ stai mcp                      # 以 MCP server (stdio) 暴露 review 能力,供 
 1. 如果全局配置文件 `~/.config/stai/config.toml` 不存在且运行在交互式终端中，
    会先通过向导让你选择语言、填写 provider 地址/密钥、从 `/models` 接口选择模型，
    并选择要注册的 SourceTree 自定义操作（可全部或部分），最后生成配置文件；
-2. 向当前仓库写入 `prepare-commit-msg` 钩子（空提交信息时自动生成，绝不阻断提交）；
+2. 向当前仓库写入 `prepare-commit-msg` 钩子（命令行提交时，若 message 文件去掉注释后仍为空，就把生成说明写入该文件，绝不阻断提交；这与 SourceTree 提交框不是同一条路径，见下文）；
 3. 向当前仓库写入 `pre-commit` 钩子（仅在 `review.strict = true` 时审查并阻断高危提交，
    其余情况直接放行）；
 4. 向当前仓库写入 `pre-push` 钩子（仅在 `pre_push.strict = true` 时审查分支 diff 并阻断
@@ -88,26 +88,37 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 > **注意**：重装前先退出 SourceTree。它在运行时会用内存中的动作列表覆盖 `actions.plist`，
 > 导致写入丢失。注册后需重启 SourceTree 才会出现菜单项。
 
+`install` 在写入 `actions.plist` 之前，以及 `doctor` 在检查该文件时，用两条大小写敏感的精确进程名判断应用是否在运行：`pgrep -x Sourcetree` 与 `pgrep -x SourceTree`。已核实的进程名是 `Sourcetree`。`SourceTree` 只保留为精确名兼容，并不表示已核实仍有版本使用这个拼写。任一名字在运行时，命令把下面这句打到 stderr（交互式 `install` 会把这句单独成段）或诊断报告，然后继续写入或检查，退出码不因此失败：
+
+> 正在运行的 SourceTree 可能用内存中的动作列表覆盖刚才写入的文件，请先退出再装、装完再打开。
+
+两个名字都不在运行时，不发这句。检测不看窗口标题、plist 锁文件或 bundle 路径，也不做大小写不敏感或子串匹配。
+
 ## 使用方式
 
-### 自定义操作（推荐）
+### 自定义操作（SourceTree 4.2.20 macOS）
 
-在 SourceTree 中暂存改动，然后执行 **动作 → 自定义操作 → AI 生成提交信息**（或按 ⌥G）：
+在 SourceTree 4.2.20（macOS）里暂存改动，然后按 **⌥G**（**动作 → 自定义操作 → AI 生成提交信息**）。主路径是 **⌥G → 通知 → 提交框 Cmd+V**：
 
-1. 消息复制到剪贴板，并弹出系统通知展示全文（SourceTree 会丢弃自定义操作的输出，不看通知就看不到消息）；
+1. 生成的说明复制到剪贴板，并用系统通知展示全文。通知不抢焦点。SourceTree 会丢弃自定义操作的标准输出，不看通知就看不到内容；
 2. 光标点在提交框中，按 Cmd+V 粘贴；
 3. 在提交框中审阅、修改后提交。
 
-全程不改变窗口焦点，不会未经确认就写入提交框，也不会覆盖你已写的草稿。
+打开提交框不会运行 `prepare-commit-msg`。全程不改变窗口焦点，不会未经确认就写入提交框，也不会覆盖你已写的草稿。
+
+提交框为空就点提交时，SourceTree 4.2.20（macOS）会先弹出系统警告「Empty Commit Message / 你没有填写提交说明」。用户确认之后，git 才运行 `prepare-commit-msg`。钩子此时写入的是 message 文件，生成的说明不会出现在提交框里。
+
+以上 SourceTree 行为仅限 4.2.20（macOS）。Windows 与更早版本不在本说明的核对范围内。其他未验证版本同样不在核对范围内。
 
 等价命令行：`stai gen`；`stai gen --edit` 会先弹出可编辑对话框，确认后再复制。
 
-### 钩子兜底（零操作）
+### 命令行空信息提交（钩子写入 message 文件）
 
-直接提交且提交框留空时，`prepare-commit-msg` 钩子会自动生成信息并填入提交框。
+本节只说明命令行 `git commit`。钩子处理的是 git 的 message 文件。
 
-以下情况不会处理：merge / squash / `commit --amend` 类提交，以及已有信息的提交。
-生成失败只打印警告，不会阻断提交（内部 120 秒超时保护）。
+message 文件去掉注释后仍为空时，`prepare-commit-msg` 生成说明并写入该文件。写入成功后发一条不抢焦点的通知，告知这次提交用了生成的说明。已有文案、merge、squash、amend（`source == "commit"`）、无暂存、`STAI_DISABLE` 时不写文件，也不发这条通知。
+
+生成失败时可以用同一通知通道报错，退出码仍为 0，提交不会被阻断。若用户确认空提交且钩子生成失败，仍可能留下空提交；这一策略保持不变。钩子内部有 120 秒超时。
 
 ### 提交前审查（M2）
 
@@ -413,7 +424,7 @@ docs/            设计说明（design.md）
 
 ## 路线图
 
-- **M1 — commit 信息生成**（已完成）：`stai gen`（生成并复制）、`stai hook prepare-commit-msg`（空信息兜底）、`stai install`。
+- **M1 — commit 信息生成**（已完成）：`stai gen`（生成并复制）、`stai hook prepare-commit-msg`（命令行空 message 文件兜底）、`stai install`。
   验收标准：在 SourceTree 中全流程跑通，不离开 GUI。
 - **M2 — 提交前 review**（已完成）：`stai review`（自定义操作 ⌥R，建议模式）+
   `stai hook pre-commit`（严格模式开关 `review.strict`）+ `stai uninstall`。

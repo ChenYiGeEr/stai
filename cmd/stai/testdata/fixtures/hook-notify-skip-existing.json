@@ -1,0 +1,12 @@
+{
+  "id": "hook-notify-skip-existing",
+  "command": "stai hook prepare-commit-msg <msg-file>",
+  "exit_code": 0,
+  "stderr": "",
+  "notification": null,
+  "initial_message_file": "feat: 已有说明\n",
+  "message_file": "feat: 已有说明\n",
+  "stage": true,
+  "model": "none",
+  "notes": "Existing non-comment message: file untouched, no notification."
+}

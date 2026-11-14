@@ -34,7 +34,7 @@ variable overrides it temporarily.
 
 - macOS (the SourceTree integration relies on `osascript`, `pbcopy` and
   SourceTree's `actions.plist`);
-- SourceTree (verified on 4.2.19);
+- SourceTree (check version 4.2.20 (macOS));
 - Go 1.23+ (only for building from source);
 - An OpenAI-compatible model endpoint — local Ollama by default
   (`http://localhost:11434/v1`), LM Studio or API gateways work too.
@@ -61,8 +61,10 @@ stai mcp                      # expose the review capability as an MCP server (s
    `/models` endpoint (or type one manually if the endpoint fails), and select
    which SourceTree custom actions to register (`all` or a subset). The
    resulting config file is written before the hooks are installed.
-2. Writes a `prepare-commit-msg` hook into the current repo (generates a
-   message when the commit box is left empty; never blocks a commit);
+2. Writes a `prepare-commit-msg` hook into the current repo (on a CLI
+   commit, if the message file is still empty after comments are removed,
+   the hook writes a generated message into that file and never blocks the
+   commit; this is separate from the SourceTree commit-box path below);
 3. Writes a `pre-commit` hook (reviews and blocks only when
    `review.strict = true`; passes otherwise);
 4. Writes a `pre-push` hook (reviews the branch diff and blocks the push
@@ -97,33 +99,71 @@ entries — anything created by other tools is preserved.
 > discards the registration. Restart SourceTree afterwards to see the menu
 > items.
 
+Before `install` writes `actions.plist`, and when `doctor` checks that file,
+stai looks for a running app by two case-sensitive exact process names:
+`pgrep -x Sourcetree` and `pgrep -x SourceTree`. The verified process name is
+`Sourcetree`. The `SourceTree` check is only an exact-name compatibility
+match; it is not a claim that any current version was verified to still use
+that spelling. If either name is running, the command prints the sentence
+below on stderr (an interactive `install` puts it in its own block) or in the
+doctor report, then keeps writing or checking. The exit code does not become
+a failure because of this warning:
+
+> A running SourceTree may overwrite the file just written with the action
+> list it still has in memory. Quit SourceTree before installing, then open
+> it again after installing.
+
+If neither exact name is running, this warning is not printed. The check does
+not use a window title, a plist lock, or a bundle path, and it does not do a
+case-insensitive or substring match.
+
 ## Usage
 
-### Custom actions (recommended)
+### Custom actions (SourceTree 4.2.20 on macOS)
 
-Stage your changes in SourceTree, then run
-**Actions → Custom Actions → AI 生成提交信息** (or press ⌥G):
+Stage your changes in SourceTree 4.2.20 (macOS), then press **⌥G**
+(**Actions → Custom Actions → AI 生成提交信息**). The main path is
+**⌥G → notification → Cmd+V in the commit box**:
 
-1. The message is copied to the clipboard and shown in a system notification
-   (SourceTree discards custom-action stdout — without the notification you
-   would see nothing);
+1. The generated message is copied to the clipboard and shown in a system
+   notification that does not take focus (SourceTree discards custom-action
+   stdout — without the notification you would see nothing);
 2. Click into the commit box and press Cmd+V;
 3. Review, edit, and commit.
 
-The window focus never changes; nothing is written into the commit box
-without your confirmation, and your existing draft is never overwritten.
+Opening the commit box does not run `prepare-commit-msg`. The window focus
+never changes; nothing is written into the commit box without your
+confirmation, and your existing draft is never overwritten.
+
+Committing from an empty box on SourceTree 4.2.20 (macOS) first shows the
+system warning "Empty Commit Message / 你没有填写提交说明". After you confirm
+that warning, git runs `prepare-commit-msg`. The hook writes the message
+file; the generated text does not show up in the commit box.
+
+These SourceTree statements are limited to 4.2.20 (macOS). Windows and older
+versions are outside what this document has checked. Other unchecked versions
+are outside it as well.
 
 CLI equivalent: `stai gen`; `stai gen --edit` first shows an editable dialog
 and copies only after confirmation.
 
-### Hook fallback (zero actions)
+### CLI commit with an empty message file (hook writes the message file)
 
-Commit with an empty message box and the `prepare-commit-msg` hook fills in
-a generated message automatically.
+This section describes command-line `git commit` only. The hook works on
+git's message file.
 
-It skips: merge / squash / `commit --amend` style commits, and commits that
-already carry a message. Generation failures print a warning and never block
-the commit (a 120-second internal timeout caps the wait).
+When the message file is still empty after comments are removed,
+`prepare-commit-msg` generates a message and writes it into that file. After
+the write succeeds, the hook posts a notification that does not take focus,
+saying this commit used a generated message. It does not write the file and
+does not post that notification when the file already has a message, on
+merge, squash, or amend (`source == "commit"`), when nothing is staged, or
+when `STAI_DISABLE` is set.
+
+On failure the hook may report the error through that same notification
+channel and still exits 0, so the commit is not blocked. If you confirm an
+empty commit and generation fails, an empty commit can still be left behind;
+this policy is unchanged. A 120-second internal timeout caps the wait.
 
 ### Pre-commit review (M2)
 
@@ -463,7 +503,7 @@ See [SECURITY.md](SECURITY.md) for the security design (config file permissions,
 ## Roadmap
 
 - **M1 — commit message generation** (done): `stai gen` (generate & copy),
-  `stai hook prepare-commit-msg` (empty-box fallback), `stai install`.
+  `stai hook prepare-commit-msg` (CLI empty message-file fallback), `stai install`.
   Acceptance: full flow works inside SourceTree without leaving the GUI.
 - **M2 — pre-commit review** (done): `stai review` (⌥R custom action,
   advisory mode) + `stai hook pre-commit` (`review.strict` gate) +
