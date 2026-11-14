@@ -1,0 +1,6 @@
+{
+  "hunks": [
+    {"explanation": "accept the first hunk", "choice": "merge", "resolution": "ACCEPTED-1\n"},
+    {"explanation": "this recommendation must stay out of the skipped hunk", "choice": "merge", "resolution": "FORBIDDEN-REC-2\n"}
+  ]
+}

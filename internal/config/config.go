@@ -497,6 +497,11 @@ func stripComment(s string) string {
 }
 
 func set(cfg *Config, section, key, raw string) error {
+	// The 2026-11-12 mergetool slice does not implement auto_apply. A config
+	// that still names the key must load; the key changes no behavior.
+	if key == "auto_apply" {
+		return nil
+	}
 	var err error
 	switch section + "." + key {
 	case "global.lang":
@@ -645,6 +650,9 @@ func set(cfg *Config, section, key, raw string) error {
 
 // setRule parses one key inside a [[review.rule]] table.
 func setRule(rs *ReviewRule, key, raw string) error {
+	if key == "auto_apply" {
+		return nil
+	}
 	var err error
 	switch key {
 	case "include":

@@ -2,15 +2,12 @@ package main
 
 import (
 	"context"
-	"flag"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
 	"time"
-
-	"stai/internal/i18n"
 )
 
 // fatal prints the error to stderr and exits with code 1.
@@ -59,19 +56,6 @@ func filepathEvalSymlinks(p string) (string, error) {
 // for embedding stai commands in a larger cancellable flow.
 func commandContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(parent, timeout)
-}
-
-// notImplemented prints a placeholder message for unimplemented commands.
-func notImplemented(cmd, plan string) {
-	fmt.Printf(i18n.T("mergetool_not_impl"), cmd, plan)
-}
-
-// cmdMergetool is a placeholder for the mergetool command (M3).
-func cmdMergetool(args []string) {
-	fs := flag.NewFlagSet("mergetool", flag.ExitOnError)
-	fs.Parse(args)
-	notImplemented("mergetool",
-		"M3: wrap git mergetool, per-hunk explanation + recommendation, never auto-write")
 }
 
 // validateFileInRepo ensures filePath is inside repoDir, preventing a custom
