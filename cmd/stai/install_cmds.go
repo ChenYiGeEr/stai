@@ -139,7 +139,9 @@ exit 0
 	if len(actions) == 0 {
 		return
 	}
-	if err := installSourceTreeActions(exe, actions); err != nil {
+	// Warn, then keep writing. The warning is not a failed install.
+	warnIfSourceTreeRunning(sourceTreeInstallInteractiveFn())
+	if err := installSourceTreeActionsFn(exe, actions); err != nil {
 		fmt.Fprintf(os.Stderr, i18n.T("install_actions_failed"), err)
 		fmt.Fprintln(os.Stderr, i18n.T("install_add_manually"))
 		for _, a := range actions {
@@ -265,6 +267,11 @@ func sourceTreeActions(st config.SourceTree) []staiAction {
 		{st.ChangelogActionCaption, "changelog -repo=$REPO", 0, 0, "", false},
 	}
 }
+
+// installSourceTreeActionsFn is installSourceTreeActions in production.
+// Tests replace it so a fixture can prove install keeps writing without
+// touching a real SourceTree actions.plist.
+var installSourceTreeActionsFn = installSourceTreeActions
 
 // installSourceTreeActions registers the custom actions in SourceTree's real
 // action storage: ~/Library/Application Support/SourceTree/actions.plist,

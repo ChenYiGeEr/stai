@@ -76,6 +76,8 @@ stai uninstall                # 移除 install 写入的一切（只删 stai 自
 
 首次 `stai install` 且 `~/.config/stai/config.toml` 不存在时，会启动交互式向导，让你选择语言、填写模型服务地址/密钥、选择模型，以及挑选要注册的 SourceTree 自定义操作。
 
+`install` 与 `doctor` 用 `pgrep -x Sourcetree` 和 `pgrep -x SourceTree` 做大小写敏感的精确进程名检查。已核实的进程名是 `Sourcetree`；`SourceTree` 只作精确名兼容，并不表示已核实仍有版本使用该拼写。任一在运行时发出警告并继续，两个都不在运行时不发这句。检测不使用窗口标题、plist 锁文件、bundle 路径、大小写不敏感或子串匹配。
+
 详细用法见 [README.md](README.md)。
 
 ## 验证安装

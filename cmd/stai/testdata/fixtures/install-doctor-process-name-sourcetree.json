@@ -1,0 +1,16 @@
+{
+  "id": "install-doctor-process-name-sourcetree",
+  "process_name": "Sourcetree",
+  "pgrep_sourcetree_command": "pgrep -x Sourcetree",
+  "pgrep_sourcetree_exit": 0,
+  "pgrep_source_tree_command": "pgrep -x SourceTree",
+  "pgrep_source_tree_exit": 1,
+  "source_tree_only_would_miss": true,
+  "install_command": "stai install",
+  "install_exit_code": 0,
+  "install_stderr": "\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\nstai: 警告\n正在运行的 SourceTree 可能用内存中的动作列表覆盖刚才写入的文件，请先退出再装、装完再打开。\n!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n\n",
+  "doctor_command": "stai doctor",
+  "doctor_exit_code": 0,
+  "warning": "正在运行的 SourceTree 可能用内存中的动作列表覆盖刚才写入的文件，请先退出再装、装完再打开。",
+  "expect_warning": true
+}

@@ -99,6 +99,24 @@ entries — anything created by other tools is preserved.
 > discards the registration. Restart SourceTree afterwards to see the menu
 > items.
 
+Before `install` writes `actions.plist`, and when `doctor` checks that file,
+stai looks for a running app by two case-sensitive exact process names:
+`pgrep -x Sourcetree` and `pgrep -x SourceTree`. The verified process name is
+`Sourcetree`. The `SourceTree` check is only an exact-name compatibility
+match; it is not a claim that any current version was verified to still use
+that spelling. If either name is running, the command prints the sentence
+below on stderr (an interactive `install` puts it in its own block) or in the
+doctor report, then keeps writing or checking. The exit code does not become
+a failure because of this warning:
+
+> A running SourceTree may overwrite the file just written with the action
+> list it still has in memory. Quit SourceTree before installing, then open
+> it again after installing.
+
+If neither exact name is running, this warning is not printed. The check does
+not use a window title, a plist lock, or a bundle path, and it does not do a
+case-insensitive or substring match.
+
 ## Usage
 
 ### Custom actions (SourceTree 4.2.20 on macOS)

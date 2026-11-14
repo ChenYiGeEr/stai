@@ -120,7 +120,8 @@ func cmdDoctor(args []string) {
 		warn(fmt.Sprintf(i18n.T("doctor_hooks_missing"), installed))
 	}
 
-	// SourceTree actions
+	// SourceTree actions. Warn when the app is running, then keep checking.
+	warnIfSourceTreeRunningDoctor()
 	exe, err := os.Executable()
 	if err == nil {
 		if resolved, ferr := filepathEvalSymlinks(exe); ferr == nil {
@@ -150,7 +151,7 @@ func cmdDoctor(args []string) {
 			symlinkPath = ""
 		}
 	}
-	if count, err := countSourceTreeActions(exe, symlinkPath); err == nil {
+	if count, err := countSourceTreeActionsFn(exe, symlinkPath); err == nil {
 		ok(fmt.Sprintf(i18n.T("doctor_actions_count"), count))
 	} else {
 		warn(fmt.Sprintf(i18n.T("doctor_actions_error"), err))
@@ -172,6 +173,11 @@ func ok(msg string)    { fmt.Printf("  %s %s\n", color.Green(i18n.T("doctor_ok")
 func warn(msg string)  { fmt.Printf("  %s %s\n", color.Yellow(i18n.T("doctor_warn")), msg) }
 func fail(msg string)  { fmt.Printf("  %s %s\n", color.Red(i18n.T("doctor_fail")), msg) }
 func infof(msg string) { fmt.Printf("  %s %s\n", color.Gray("[i]"), msg) }
+
+// countSourceTreeActionsFn is countSourceTreeActions in production.
+// Tests replace it so doctor can be exercised without reading a real
+// SourceTree actions.plist.
+var countSourceTreeActionsFn = countSourceTreeActions
 
 // countSourceTreeActions returns how many stai entries are present in
 // SourceTree's actions.plist without modifying the file.

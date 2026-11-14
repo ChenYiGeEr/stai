@@ -76,6 +76,8 @@ stai uninstall                # remove everything install wrote (stai-owned entr
 
 The first time you run `stai install` and `~/.config/stai/config.toml` does not exist, an interactive wizard will ask for language, provider base URL/API key, model, and which SourceTree custom actions to register.
 
+`install` and `doctor` check the case-sensitive exact process names `pgrep -x Sourcetree` and `pgrep -x SourceTree`. The verified process name is `Sourcetree`. The `SourceTree` check is only an exact-name compatibility match; it is not a claim that any current version was verified to still use that spelling. If either name is running they warn and continue; if neither is running they do not print this warning. The check does not use a window title, a plist lock, a bundle path, or a case-insensitive or substring match.
+
 For detailed usage, see [README.en.md](README.en.md).
 
 ## Verify the installation

@@ -1,3 +1,78 @@
+# stai 绑定切片 2026-11-14：install/doctor 进程名改为匹配 Sourcetree
+
+Decision needed: approve this cut | reject a listed out item.
+
+- 产品：stai（CLI + SourceTree 4.2.20 macOS 自定义操作与 Git 钩子）
+- 日期：2026-11-14（亚洲/上海）
+- 状态：已批准。日期：2026-11-14（亚洲/上海）。
+- 与既有切片的关系：本切片是对已批准的「stai 绑定切片 2026-11-14：SourceTree 核对版本改为 4.2.20」的中途范围变更，同时修订其继承自 2026-11-13 的 AC-6 进程名检测锁。原因：机主已批准 2026-11-14 后，在本机核对 SourceTree 4.2.20（build 324，`/Applications/Sourcetree.app`）时发现，CFBundleExecutable、Unix 进程名和 System Events 进程名都是 `Sourcetree`（小写 t）；`pgrep -x SourceTree` 匹配不到，`pgrep -x Sourcetree` 可以（观察当时 PID 89391，该 PID 只作现场记录，不作验收条件）。这与 2026-11-13/2026-11-14 锁死的「只匹配进程名 `SourceTree`」不符。2026-11-14 写明若 4.2.20 进程名不同，须停止并报告，不得改检测方式、不得软通过；机主已要求另出本切片。本切片不替代 2026-11-13 或 2026-11-14 全文；这两份的范围内/范围外与 AC 仍有效，仅「进程名检测」与 AC-6 中与检测相关的条款以本切片为准。禁止用聊天修改已批准的 2026-11-13 或 2026-11-14 正文，或用聊天改本切片范围。本切片不替代、不修改、不推进「stai 绑定切片 2026-11-12：文本冲突 mergetool」。
+- 活文档：仓库内 `docs/design.md`（本切片与 2026-11-13、2026-11-14 一并作为 PM 结论优先）；批准后将本切片置于该文档顶部（或所有者指定的切片路径），并保留 2026-11-13 与 2026-11-14 切片，勿改写其正文。
+- 现场状态（批准前仍不得采集、不得改 plist）：已做备份 `~/Library/Application Support/SourceTree/actions.plist.bak-20261114-093258`（以及 `/Users/lim/code/GitHub/stai-qa-proofs-7d6c140/sourcetree-4220-sample/` 下的同名副本），校验和与当时原文件一致。曾打开过 SourceTree，但尚未添加临时动作、尚未采集样本。随后本机连接断开，未能确认应用已退出，也未能确认已用备份覆盖回去。上述恢复与退出状态在本切片批准前不得用改 plist 或采集的方式去核实。
+
+## 成功标准
+
+Decision needed: approve this cut.
+
+`install` / `doctor` 在 SourceTree 4.2.20（macOS）仍在运行时能发出警告并继续写入：检测须能匹配已核实的进程名 `Sourcetree`，同时也精确兼容 `SourceTree`。未批准前不采集、不改机主 `actions.plist`。不得软通过。不自动改工作区或提交框，AI 故障不阻断提交或推送。
+
+## 范围内
+
+Decision needed: approve this in-list.
+
+- 进程名检测改为：只按进程名做大小写敏感的精确匹配，匹配到 `Sourcetree` 或 `SourceTree` 任一即视为正在运行（例如 `pgrep -x Sourcetree` 或 `pgrep -x SourceTree`，或只匹配这两个精确进程名的同等检查）。4.2.20 已核实的进程名是 `Sourcetree`，必须能匹配到；保留对 `SourceTree` 的精确匹配，是为了在其他版本若仍使用该精确名时同样警告并继续，并不声称当前已核实任何版本仍使用 `SourceTree`。
+- 若这两个精确名之一在跑：`install` 与 `doctor` 发出警告并继续写入，不拒绝安装；警告必须出现在 stdout 或 stderr；交互式 `install` 里须显眼（不得只写进日志）；退出码不因这条警告变为失败。警告须说明：正在运行的 SourceTree 可能用内存中的动作列表覆盖刚才写入的文件，请先退出再装、装完再打开。两个精确名都不在跑时，不发这条警告。Mac App Store 版与直装版只要进程名是这两个精确名之一，都要警告。
+- 文档、注释与 `doctor`/`install` 相关说明中，凡把检测写成只匹配 `SourceTree` 或只写 `pgrep -x SourceTree` 作为唯一检查的，须改为上述两条精确名。用户可见警告仍可称呼产品为 SourceTree，但检测不得只查 `SourceTree`。
+- 批准之后、开始任何 `actions.plist` 采集或写入之前，须先确认：没有正在运行的 `Sourcetree` 或 `SourceTree` 进程；并且当前 `~/Library/Application Support/SourceTree/actions.plist` 与备份 `actions.plist.bak-20261114-093258` 校验和一致，若不一致或无法确认，则先用该备份（若缺失则用 `stai-qa-proofs-7d6c140/sourcetree-4220-sample/` 下的同名副本）覆盖回去再继续。这是现场安全前置条件，不是新功能。
+- 2026-11-14 其余锁死点不变：核对版本仍是 4.2.20（macOS，build 324）；第 1 组 AC-2/AC-3 PASS 保留；AC-8 文档版本表述、AC-4 须用 4.2.20 界面保存样本做字节级对照、矩阵与 Show Full Output 静态开关、changelog 只开日志、不接 `$SHA`、`separateWindow` 全关，均仍按 2026-11-14 执行。
+
+## 范围外
+
+Decision needed: reject a listed out item, or approve the out-list as written.
+
+- 在本切片批准前采集类型样本、改机主 `actions.plist`、开始写入，或用改 plist / 采集的方式去核实应用是否已退出、备份是否已恢复。
+- 用窗口标题、plist 锁文件、仅用 bundle 路径、大小写不敏感或子串匹配（例如误匹配 helper 进程）来判定 SourceTree 是否在跑。
+- 把检测改回只匹配 `SourceTree`，或把「4.2.20 进程名不同」软通过。
+- 在无新证据时改冻结矩阵、打开 `separateWindow`、接 `$SHA`、把 changelog 开到仓库或文件、或改 Show Full Output 的静态开关策略。
+- mergetool、apply-fixes、split --apply、新 MCP 工具，以及任何对「stai 绑定切片 2026-11-12：文本冲突 mergetool」的范围改动或推进。
+- 重开或重跑已 PASS 的 AC-2、AC-3，或回改 SHA `7d6c140` / PR #1 的第 1 组历史证明。
+- 2026-11-13 / 2026-11-14 范围外已列明的其余项仍为范围外。
+
+## 验收标准
+
+Decision needed: approve these ACs and the unlock order below.
+
+AC-9 `install` / `doctor` 按 `Sourcetree` 或 `SourceTree` 精确检测  
+Proof: SHA（检测实现与被改到的文档/注释）+ fixture id `install-doctor-process-name-sourcetree`（4.2.20 运行中：实际进程名、`pgrep -x Sourcetree` 与 `pgrep -x SourceTree` 的结果、检测所用命令、完整警告原文、退出码；并证明仅用 `pgrep -x SourceTree` 会漏检）+ fixture id `install-doctor-process-name-legacy-SourceTree`（用名为 `SourceTree` 的夹具进程或同等受控进程，证明也能警告并继续；不要求安装旧版 SourceTree）+ fixture id `install-doctor-process-name-quit`（两个精确名都不在跑时不发这条警告）。  
+QA: pass if 进程名为 `Sourcetree` 时 `install` 与 `doctor` 都在 stdout 或 stderr 发出警告，交互式 install 中该警告显眼，警告后仍继续写入且退出码不因此变为失败；进程名为 `SourceTree` 时同样警告并继续；两个精确名都不在跑时不发这条警告；检测只按这两个大小写敏感的精确进程名；文档不再把唯一检查写成只匹配 `SourceTree`。
+
+AC-6 SourceTree 正在运行时警告并继续（修订检测名）  
+Proof: fixture id `install-doctor-sourcetree-running`、`install-doctor-sourcetree-quit`（检测所用进程名须包含已核实的 `Sourcetree`、完整警告原文、退出码）+ screenshot（在 4.2.20 进程 `Sourcetree` 仍运行时，交互式 install 的显眼警告）。  
+QA: pass if 在 4.2.20 上，进程名为 `Sourcetree` 的进程在跑时，`install` 与 `doctor` 都警告并继续写入；未在跑且无 `SourceTree` 进程时不发这条警告；检测符合本切片 AC-9；不得按「只匹配 `SourceTree`」判过。
+
+2026-11-14 的 AC-8、AC-4、AC-5、AC-7 仍按那份切片验收，本切片不重开。AC-6 以本切片为准。AC-2、AC-3 仍不重开。
+
+## 解锁顺序
+
+Decision needed: approve this unlock order.
+
+本切片批准前：不得采集、不得改机主 `actions.plist`、不得开始写入，不得打开 Cloud Agent，也不得用改 plist 或采集去核实现场恢复状态。
+
+1. 批准之后、任何 `actions.plist` 采集或写入之前：先确认无 `Sourcetree` / `SourceTree` 进程在跑，并确认当前 plist 与备份校验和一致或已从备份恢复。
+2. AC-9（进程名检测与相关文档）须在任何会写入 `actions.plist` 的 `install` 之前 PASS，以免 AC-4 写入时警告仍漏检。
+3. 然后继续 2026-11-14 顺序：AC-8（文档版本表述；可与 AC-9 的文档改动一并提交，但版本表述与进程名表述都要各自可判），再 AC-4（先 4.2.20 样本后写入）→ AC-5，然后修订后的 AC-6 → AC-7。
+
+AC-9、AC-8 与 AC-4/5/6/7 全部 PASS 之前，本切片与 2026-11-14 切片都不算完成，不得把未完成项软通过。本切片不解锁、不开始 mergetool 或任何范围外工作。若再出现与锁死点不符的新证据，停止并回到所有者出新的注明日期切片，禁止用聊天改范围。
+
+## 交接
+
+Decision needed: approve this handoff. Eng/QA 角色尚未命名。
+
+- **Eng：** 切片路径为仓库外草案 `/workspace/stai-prd-cuts/2026-11-14-sourcetree-process-name.md`；批准后写入 `docs/design.md` 顶部或所有者指定的切片路径，并保留 2026-11-13 与 2026-11-14 切片正文不改写。日期 2026-11-14。按解锁顺序：先完成现场 plist 前置条件，再 AC-9，然后 AC-8 → AC-4（先样本后写入）→ AC-5 → AC-6 → AC-7。证明按各 AC 的 Proof 提交。批准前不要打开 Cloud Agent，不要采集样本，不要改机主 `actions.plist`，不要开始写入。
+- **QA：** 只按本切片与仍有效的 2026-11-13、2026-11-14 条款改写验收包；AC-6 以本切片为准；禁止软通过；使用同一 Proof 表。
+- 所有者：批准后，hand this cut to your Eng when ready。2026-11-12 mergetool 切片仍为草案、仍暂停，不随本切片一起交给工程，除非所有者另决并先批准那一份。
+
+---
+
 # stai 绑定切片 2026-11-14：SourceTree 核对版本改为 4.2.20
 
 Decision needed: approve this cut | reject a listed out item.

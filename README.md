@@ -88,6 +88,12 @@ uninstall 只删除带 `installed by stai` 标记的钩子和匹配 stai 的动�
 > **注意**：重装前先退出 SourceTree。它在运行时会用内存中的动作列表覆盖 `actions.plist`，
 > 导致写入丢失。注册后需重启 SourceTree 才会出现菜单项。
 
+`install` 在写入 `actions.plist` 之前，以及 `doctor` 在检查该文件时，用两条大小写敏感的精确进程名判断应用是否在运行：`pgrep -x Sourcetree` 与 `pgrep -x SourceTree`。已核实的进程名是 `Sourcetree`。`SourceTree` 只保留为精确名兼容，并不表示已核实仍有版本使用这个拼写。任一名字在运行时，命令把下面这句打到 stderr（交互式 `install` 会把这句单独成段）或诊断报告，然后继续写入或检查，退出码不因此失败：
+
+> 正在运行的 SourceTree 可能用内存中的动作列表覆盖刚才写入的文件，请先退出再装、装完再打开。
+
+两个名字都不在运行时，不发这句。检测不看窗口标题、plist 锁文件或 bundle 路径，也不做大小写不敏感或子串匹配。
+
 ## 使用方式
 
 ### 自定义操作（SourceTree 4.2.20 macOS）
