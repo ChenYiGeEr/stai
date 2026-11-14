@@ -1,0 +1,3 @@
+merge.tool=opendiff
+!mergetool.stai.cmd
+!mergetool.stai.trustExitCode

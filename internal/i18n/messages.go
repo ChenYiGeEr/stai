@@ -223,6 +223,14 @@ var zhCN = map[string]string{
 	"mergetool_write_failed":      "写入合并文件失败: %v",
 	"mergetool_done":              "全部冲突块已解决",
 	"mergetool_left":              "仍有未解决的冲突块",
+	"mergetool_tool_occupied":     "merge.tool 当前是 %s。是否改为 stai? 拒绝仍会注册 mergetool.stai,之后可用 git mergetool --tool=stai",
+	"mergetool_registered":        "已注册 mergetool.stai",
+	"mergetool_tool_set":          "merge.tool 已设为 stai",
+	"mergetool_tool_kept":         "merge.tool 保持为 %s",
+	"mergetool_removed":           "已移除 mergetool.stai",
+	"mergetool_tool_restored":     "merge.tool 已恢复为 %s",
+	"mergetool_tool_cleared":      "已取消 merge.tool",
+	"mergetool_tool_left":         "merge.tool 未改动 (%s)",
 }
 
 // en mirrors zhCN in English.
@@ -440,6 +448,14 @@ Disable hooks without uninstalling: STAI_DISABLE=1
 	"mergetool_write_failed":      "writing the merged file failed: %v",
 	"mergetool_done":              "Every conflict hunk is resolved",
 	"mergetool_left":              "Unresolved conflict hunks remain",
+	"mergetool_tool_occupied":     "merge.tool is currently %s. Change it to stai? Refusing still registers mergetool.stai, so git mergetool --tool=stai keeps working",
+	"mergetool_registered":        "Registered mergetool.stai",
+	"mergetool_tool_set":          "merge.tool is now stai",
+	"mergetool_tool_kept":         "merge.tool left as %s",
+	"mergetool_removed":           "Removed mergetool.stai",
+	"mergetool_tool_restored":     "merge.tool restored to %s",
+	"mergetool_tool_cleared":      "merge.tool unset",
+	"mergetool_tool_left":         "merge.tool unchanged (%s)",
 }
 
 var messages = map[string]map[string]string{
